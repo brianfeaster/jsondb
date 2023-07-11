@@ -1,6 +1,6 @@
 [package]
 name = "jsondb"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2018"
 
 [profile.dev]
@@ -10,10 +10,7 @@ lto = "off"
 [dependencies]
 env_logger = "*"
 log = "*"
-awc = "*"
-rustls-pemfile = "*"
-actix-web = { version = "*", features = ["rustls"] }
-rustls = "0.20.8"
-serde = "*"
+openssl = "*"
+actix-web = { version = "3.*", features = ["openssl"] }
 serde_json = "*"
 regex = "*"

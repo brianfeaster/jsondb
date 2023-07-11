@@ -1,6 +1,6 @@
 # About JSONDB
 
-REST accessible JSON database with integrated RPN scripting.
+HTTPS accessible JSON database with integrated RPN scripting.
 
 # Quick Start
 

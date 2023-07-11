@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use std::{
-    env, fs::File, io::{Write, BufReader}, error::Error,
+    env, io::{Write}, error::Error,
     time::{Duration, SystemTime, UNIX_EPOCH}, sync::{Arc, Mutex},
     str::{from_utf8}};
 
@@ -11,14 +11,11 @@ use log::{
 
 use env_logger::fmt::{Formatter, Color};
 
-use rustls::{Certificate, server::{ServerConfig}};
-use rustls_pemfile::{pkcs8_private_keys};
-//use rustls::internal::pemfile::{certs, pkcs8_private_keys};
-
+use ::openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use actix_web::{
-    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse};
-
-use awc::{Client};
+    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse, Route, Result,
+    client::{Client, Connector}
+};
 
 use serde_json::{json, Value};
 
@@ -58,11 +55,16 @@ pub fn bytes2json (body: &[u8]) -> Bresult<Value> {
 }
 
 async fn httpsjson (url: &Value, j: &Value) -> Bresult<Value> {
-
-	 let mut res = Client::default()
-        .post(url.as_str().ok_or("urlNotString")?)
+    // Connect
+    let client =
+        Client::builder()
+        .connector(Connector::new().timeout(Duration::new(90,0)).finish())
+        .finish();
+    // Send it
+    let mut res =
+        client.post(url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?)
+        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36")
         .timeout(Duration::new(90,0))
-        .insert_header(("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36"))
         .send_json(&j)
         .await?;
 
@@ -74,11 +76,15 @@ async fn httpsjson (url: &Value, j: &Value) -> Bresult<Value> {
 
 async fn httpstxt (url: &str, t: &str) -> Bresult<Value> {
     // Connect
-
-    let mut res = Client::default()
-        .post(url)
+    let client =
+        Client::builder()
+        .connector(Connector::new().timeout(Duration::new(90,0)).finish())
+        .finish();
+    // Send it
+    let mut res =
+        client.post(url)
+        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36")
         .timeout(Duration::new(90,0))
-        .insert_header(("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36"))
         .send_body(t.to_string())
         .await?;
     // Log it
@@ -445,6 +451,13 @@ fn insertDictionary (rpn: &mut RPN) -> Bresult<()> {
     Ok(())
 }
 
+fn arrayPush (rpn: &mut RPN) -> Bresult<()> {
+    rpn.peek(1).map_err( |_|"underflow" )?;
+    let val = rpn.pop()?;
+    rpn.peekMut(0)?.as_array_mut().ok_or("notArray")?.push(val);
+    Ok(())
+}
+
 fn concat (rpn: &mut RPN) -> Bresult<()> {
     rpn.peek(1).map_err( |_|"underflow" )?;
     let b = rpn.pop()?;
@@ -515,6 +528,7 @@ async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Bresult<()>
         "/=" => rpn.pathAssign(),      // val /a/2 /=      =>  DB[a][2] = val
         "/." => rpn.pathLookup(),      // /a/2 /.          =>  DB[a][2]
         "."  => lookup(rpn),           // a i .            =>  a[i] on array, obj, or string
+        ":psh" => arrayPush(rpn),      //                  =>            
         ":ary" => makeArray(rpn),      // 2 4 6 3 :ary     =>  [2,4,6]
         ":dic" => makeDictionary(rpn), // 'x 'y 2 :dic     =>  {"x":1,"y"2} values from DB or null
         ":ins" => insertDictionary(rpn),//dic val key :ins =>  dic[key]=val
@@ -599,14 +613,17 @@ async fn handler (key: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespons
 
     // Maybe log this request
     if let Some(loggingEndpointUrl) = env.lock().unwrap().jsondb[key]["logging"].as_str() {
-        httpstxt(
+        info!("logging to {}", loggingEndpointUrl);
+        info!("{:?}", httpstxt(
             &loggingEndpointUrl,
             &format!("{} {} {}\n{}",
                 req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
                 req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
                 key,
                 body.unwrap_or("?")))
-        .await.ok();
+        .await);
+    } else {
+        info!("not loggin");
     }
 
     // Consider JSON value of body, or treat as plaintext to evaluate in RPN
@@ -696,48 +713,40 @@ async fn jsonDbV1 (req: HttpRequest, body: web::Bytes) -> HttpResponse {
 async fn launch () -> Bresult<()> {
     println!("::launch");
 
-    let keyfile = &mut BufReader::new( File::open(env::var_os("KEYPEM").as_ref().ok_or("Bad KEYPEM path")?)? );
-    let crtfile = &mut BufReader::new( File::open(env::var_os("CRTPEM").as_ref().ok_or("Bad CRTPEM path")?)? );
-
-    let cert_chain = rustls_pemfile::certs(crtfile)?;
-
-    let mut keys = pkcs8_private_keys(keyfile)?;
-
-    let serverConfig = ServerConfig::builder()
-    .with_safe_default_cipher_suites()
-    .with_safe_default_kx_groups()
-    .with_safe_default_protocol_versions()
-    .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain.into_iter().map(Certificate).collect(), rustls::PrivateKey(keys.remove(0)))
-        .expect("bad certificate/key");
-
-
-    let env = web::Data::new(EnvStruct::new(
+    let mut ssl_acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
+    ssl_acceptor_builder.set_private_key_file(
+        env::var_os("KEYPEM").as_ref().ok_or("Bad KEYPEM path")?,
+        SslFiletype::PEM
+    )?;
+    ssl_acceptor_builder.set_certificate_chain_file(
+        env::var_os("CRTPEM").as_ref().ok_or("Bad CRTPEM path")?
+    )?;
+    let env = EnvStruct::new(
         env::var_os("JSONDB")
             .as_ref()
             .and_then(|s|s.to_str())
             .map(|o| o.to_string())
-            .unwrap_or("db.json".to_string()) )?);
+            .unwrap_or("db.json".to_string()) )?;
 
     info!("{:?}", env);
     let envc = env.clone();
     HttpServer::new(move ||
         App::new()
-        .app_data(envc.clone())
-        .route("keyvaluestore/v2/", web::post().to(keyValueStoreV2))
-        .route("jsondb/v1/{tail}*", web::post().to(jsonDbV1))
-        .route("/"                , web::post().to(keyValueStoreV2))
-    ).bind_rustls( //.bind("0.0.0.0:4441")?
+        .data(envc.clone())
+        .service(web::resource("keyvaluestore/v2").route(Route::new().to(keyValueStoreV2)))
+        .service(web::resource("jsondb/v1/*"     ).route(Route::new().to(jsonDbV1)))
+        .service(web::resource("/"               ).route(Route::new().to(keyValueStoreV2)))
+    ).bind_openssl( //.bind("0.0.0.0:4441")?
         "0.0.0.0:".to_string()
         + env::var_os( "DBPORT" )
             .as_ref()
             .and_then( |s|s.to_str() )
             .unwrap_or( "4441" ),
-        serverConfig)?
+        ssl_acceptor_builder)?
     .shutdown_timeout(60)
     .run()
     .await?;
+
     // Save DB
     let envl = env.lock().map_err(|e|e.to_string())?;
     let db = envl.jsondb.to_string();
