@@ -460,7 +460,7 @@ fn arrayPush (rpn: &mut RPN) -> Bresult<()> {
 fn arrayPop (rpn: &mut RPN) -> Bresult<()> {
     let a = rpn.peekMut(0).map_err( |_|"underflow" )?;
     let v = a.as_array_mut().ok_or("not array")?.pop().ok_or("empty array")?;
-    rpn.push(v);
+    rpn.push(v)?;
     Ok(())
 }
 
@@ -633,9 +633,11 @@ async fn handler_rpn (env: &Env, key: &str, body: &str) -> HttpResponse {
     }
 }
 
-async fn handler (key: &str, req: &HttpRequest, body: web::Bytes) -> HttpResponse {
+async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpResponse {
     let body = from_utf8(&body);
-    info!("{:?}{:?}\x1b[33m{}\x1b[0m", req.connection_info(), req, body.unwrap_or("{badBodyBytes}"));
+    info!("{:?}{:?}\x1b[33m{} \x1b[1m{}\x1b[0m", req.connection_info(), req, path, body.unwrap_or("{badBodyBytes}"));
+
+    let (key, pointer) = path.split_at(path.find('/').unwrap_or(path.len()));
 
     let env = req.app_data::<web::Data<Env>>().unwrap();
 
@@ -647,14 +649,28 @@ async fn handler (key: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespons
             &format!("{} {} {}\n{}",
                 req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
                 req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
-                key,
+                path,
                 body.unwrap_or("?")))
         .await);
     } else {
-        info!("not loggin");
+        info!("not logging");
     }
 
-    // Consider JSON value of body, or treat as plaintext to evaluate in RPN
+    // Direct pointer lookup
+    if pointer != "" {
+        return match env.lock().unwrap().jsondb.pointer_mut(&("/".to_string()+path)) {
+           None => {
+                error!("None");
+                HttpResponse::NotAcceptable().json(Value::Null)
+           },
+           Some(v) => {
+               info!("{}", v);
+               HttpResponse::Ok().json(v.clone())
+           }
+       }
+    }
+
+    // Consider HTTP request body as JSON, or treat as plaintext to evaluate in RPN
     let value = if req.content_type().find("json").is_some() {
         match body.map_err(|e|e.to_string()).and_then(|b|serde_json::from_str(&b).map_err(|e|e.to_string())) {
             Err(e) => {
@@ -679,8 +695,7 @@ async fn handler (key: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespons
         if db.is_null() { gdb[key] = json!({}) } // Prevent null DB
         let len :Value = js.len().into();
         info!("{}", len);
-        HttpResponse::Ok()
-            .json(len)
+        HttpResponse::Ok().json(len)
       },
       Value::Array(js) => {
         let db = &env.lock().unwrap().jsondb[key];
@@ -696,8 +711,7 @@ async fn handler (key: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespons
             resv = db.clone();
         }
         info!("{}", resv);
-        HttpResponse::Ok()
-            .json(resv)
+        HttpResponse::Ok().json(resv)
       },
       Value::String(js) => handler_rpn(env, key, &js.as_str()).await,
       _ => {
@@ -706,8 +720,7 @@ async fn handler (key: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespons
             "error":"Unaccepted JSON form."
         });
         error!("{}", resv);
-        return HttpResponse::NotAcceptable()
-            .json(resv);
+        return HttpResponse::NotAcceptable().json(resv);
       }
     }
 }
