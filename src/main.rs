@@ -123,7 +123,6 @@ impl EnvStruct {
   }
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////
 
 trait ToNum<T> { fn toNum (&self) -> Bresult<T>; }
@@ -458,11 +457,24 @@ fn arrayPush (rpn: &mut RPN) -> Bresult<()> {
     Ok(())
 }
 
+fn arrayPop (rpn: &mut RPN) -> Bresult<()> {
+    let a = rpn.peekMut(0).map_err( |_|"underflow" )?;
+    let v = a.as_array_mut().ok_or("not array")?.pop().ok_or("empty array")?;
+    rpn.push(v);
+    Ok(())
+}
+
 fn concat (rpn: &mut RPN) -> Bresult<()> {
     rpn.peek(1).map_err( |_|"underflow" )?;
     let b = rpn.pop()?;
     let a = rpn.pop()?;
     rpn.push( (a.to_str() + &b.to_str()).into() )
+}
+
+fn length (rpn: &mut RPN) -> Bresult<()> {
+    let a = rpn.peek(0).map_err( |_|"underflow" )?;
+    let l = a.as_array().ok_or("not array")?.len();
+    rpn.push( Value::from(l) )
 }
 
 fn format (rpn: &mut RPN) -> Bresult<()> {
@@ -497,6 +509,19 @@ fn run (rpn: &mut RPN<'_>) -> Bresult<()>
     Ok(())
 }
 
+fn trinary (rpn: &mut RPN<'_>) -> Bresult<()>
+{
+    rpn.peek(2)?;
+    let f = rpn.pop()?;
+    let t = rpn.pop()?;
+    let boolVal = rpn.pop()?;
+
+    let code = if 0.0 == asNum::<f64>(&boolVal)? { f } else { t };
+
+    rpn.prog.push( Prog::new( code.as_str().ok_or("notString")? ) );
+    Ok(())
+}
+
 fn lookupRun (rpn: &mut RPN<'_>, sym: &str) -> Bresult<()>
 {
     let env = rpn.env.lock().unwrap();
@@ -528,14 +553,17 @@ async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Bresult<()>
         "/=" => rpn.pathAssign(),      // val /a/2 /=      =>  DB[a][2] = val
         "/." => rpn.pathLookup(),      // /a/2 /.          =>  DB[a][2]
         "."  => lookup(rpn),           // a i .            =>  a[i] on array, obj, or string
-        ":psh" => arrayPush(rpn),      //                  =>            
+        ":psh" => arrayPush(rpn),      // [] 1             =>  [1]
+        ":pop" => arrayPop(rpn),       // [1]              =>  [] 1
         ":ary" => makeArray(rpn),      // 2 4 6 3 :ary     =>  [2,4,6]
         ":dic" => makeDictionary(rpn), // 'x 'y 2 :dic     =>  {"x":1,"y"2} values from DB or null
         ":ins" => insertDictionary(rpn),//dic val key :ins =>  dic[key]=val
         ":con" => concat(rpn),         // 'a 'b :con       =>  "ab"
+        ":len" => length(rpn),         // [1 2] :len       =>  2
         ":fmt" => format(rpn),         // 1 2 "{}{}"       =>  "21"
         ":web" => web(rpn).await,
         ":run" => run(rpn),
+        "?"    => trinary(rpn),          // b t f ?          =>  a[i] on array, obj, or string
         ":now" => rpn.push( Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()) ),
         _      => lookupRun(rpn, sym)
     }
