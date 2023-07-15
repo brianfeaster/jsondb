@@ -13,7 +13,7 @@ use env_logger::fmt::{Formatter, Color};
 
 use ::openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use actix_web::{
-    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse, Route, Result,
+    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse, Route,
     client::{Client, Connector}
 };
 
@@ -31,13 +31,13 @@ pub type Bresult<T> = Result<T, Box<dyn Error>>;
 fn logger_formatter (buf: &mut Formatter, rec: &Record) -> std::io::Result<()> {
     let mut style = buf.style();
     style.set_color(
-            match rec.level() {
-                Level::Error => Color::Red,
-                Warn  => Color::Yellow,
-                Info  => Color::Green,
-                Debug => Color::Cyan,
-                Trace => Color::Magenta
-            });
+        match rec.level() {
+            Level::Error => Color::Red,
+            Warn  => Color::Yellow,
+            Info  => Color::Green,
+            Debug => Color::Cyan,
+            Trace => Color::Magenta
+        });
     let pre = style.value(format!("{} {}:{}", rec.level(), rec.target(), rec.line().unwrap()));
     writeln!(buf, "{} {:?}", pre, rec.args())
 }
@@ -55,14 +55,11 @@ pub fn bytes2json (body: &[u8]) -> Bresult<Value> {
 }
 
 async fn httpsjson (url: &Value, j: &Value) -> Bresult<Value> {
-    // Connect
-    let client =
+    let mut res =
         Client::builder()
         .connector(Connector::new().timeout(Duration::new(90,0)).finish())
-        .finish();
-    // Send it
-    let mut res =
-        client.post(url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?)
+        .finish() // client
+        .post(url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?)
         .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36")
         .timeout(Duration::new(90,0))
         .send_json(&j)
@@ -75,14 +72,11 @@ async fn httpsjson (url: &Value, j: &Value) -> Bresult<Value> {
 }
 
 async fn httpstxt (url: &str, t: &str) -> Bresult<Value> {
-    // Connect
-    let client =
+    let mut res =
         Client::builder()
         .connector(Connector::new().timeout(Duration::new(90,0)).finish())
-        .finish();
-    // Send it
-    let mut res =
-        client.post(url)
+        .finish() // client
+        .post(url)
         .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36")
         .timeout(Duration::new(90,0))
         .send_body(t.to_string())
@@ -99,7 +93,7 @@ async fn httpstxt (url: &str, t: &str) -> Bresult<Value> {
 #[derive(Debug)]
 pub struct EnvStruct {
     dbfile: String,
-    jsondb: Value
+    jsondb: Value     // The base JSON dictionary (holds every user database)
 }
 
 type Env = Arc<Mutex<EnvStruct>>;
@@ -233,7 +227,7 @@ impl Prog {
 
 struct RPN<'c> {
    env: &'c Env,
-   key: &'c str,
+   key: &'c str, // The database name (key in base JSON dictionary) lives as long as env.
    prog: Vec<Prog>,
    stk: Vec<Value>
 }
@@ -399,6 +393,50 @@ fn makeDictionary (rpn: &mut RPN) -> Bresult<()> {
     rpn.push( j )
 }
 
+fn has (rpn: &mut RPN) -> Bresult<()> {
+    let key = rpn.peek(0)?;
+    let blob = rpn.peek(1)?;
+
+    let ret =
+    if key.as_str()
+       .map(|s| Some('/') == s.chars().next())
+       .unwrap_or(false)
+    {
+        Ok(blob.pointer(key.as_str().unwrap()).map(|_v|Value::Bool(true)).unwrap_or_else(||Value::Bool(false)))
+    } else {
+        if blob.is_array() {
+            blob.as_array()
+            .ok_or("impossible".into()) // result
+            .and_then( |ary|              //result
+                asNum::<usize>(&key) // result
+                .and_then( |k|       //result
+                    Ok(ary.get(k)
+                    .map( |_v| Value::Bool(true) )
+                    .unwrap_or_else(||Value::Bool(false)))))
+        } else if blob.is_string() {
+            blob.as_str()
+            .ok_or("impossible".into())
+            .and_then( |s|
+                asNum::<usize>(&key)
+                .and_then( |k|
+                    Ok(s.chars()
+                    .nth(k)
+                    .map(|_c| Value::Bool(true) )
+                    .unwrap_or_else(||Value::Bool(false) ) )))
+        } else if blob.is_object() {
+            blob.as_object()
+            .ok_or("impossible".into())
+            .and_then( |o|
+                Ok(o.get(&key.to_str())
+                .map(|_c| Value::Bool(true) )
+                .unwrap_or_else(||Value::Bool(false))))
+        } else {
+            Err("badBlob".into())
+        }
+    }?;
+    rpn.popPush(1, ret)
+}
+
 fn lookup (rpn: &mut RPN) -> Bresult<()> {
     let key = rpn.peek(0)?;
     let blob = rpn.peek(1)?;
@@ -553,18 +591,19 @@ async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Bresult<()>
         "/=" => rpn.pathAssign(),      // val /a/2 /=      =>  DB[a][2] = val
         "/." => rpn.pathLookup(),      // /a/2 /.          =>  DB[a][2]
         "."  => lookup(rpn),           // a i .            =>  a[i] on array, obj, or string
+        ":has" => has(rpn),            // {a:1} 'b :has    =>  {a:1} false
         ":psh" => arrayPush(rpn),      // [] 1             =>  [1]
-        ":pop" => arrayPop(rpn),       // [1]              =>  [] 1
-        ":ary" => makeArray(rpn),      // 2 4 6 3 :ary     =>  [2,4,6]
+        ":pop" => arrayPop(rpn),       // [1 2]            =>  [1] 2
+        ":ary" => makeArray(rpn),      // 10 12 14 3 :ary     =>  [14 12 10]
         ":dic" => makeDictionary(rpn), // 'x 'y 2 :dic     =>  {"x":1,"y"2} values from DB or null
-        ":ins" => insertDictionary(rpn),//dic val key :ins =>  dic[key]=val
+        ":ins" => insertDictionary(rpn),// {} val key :ins =>  {key:val}
         ":con" => concat(rpn),         // 'a 'b :con       =>  "ab"
-        ":len" => length(rpn),         // [1 2] :len       =>  2
-        ":fmt" => format(rpn),         // 1 2 "{}{}"       =>  "21"
+        ":len" => length(rpn),         // [10 11] :len     =>  [10 11] 2
+        ":fmt" => format(rpn),         // 1 2 "{}a{}" :fmt =>  "2a1"
         ":web" => web(rpn).await,
-        ":run" => run(rpn),
-        "?"    => trinary(rpn),          // b t f ?          =>  a[i] on array, obj, or string
-        ":now" => rpn.push( Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()) ),
+        ":run" => run(rpn),            // "1 2 +" :run     =>  3
+        "?"    => trinary(rpn),        // b t f ?          =>  :run's t if b is 1, otherwise :run f
+        ":now" => rpn.push( Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()) ), // epoch seconds
         _      => lookupRun(rpn, sym)
     }
 }
@@ -633,6 +672,29 @@ async fn handler_rpn (env: &Env, key: &str, body: &str) -> HttpResponse {
     }
 }
 
+async fn loghackers (req: HttpRequest, body: web::Bytes) -> HttpResponse {
+    let body = from_utf8(&body);
+    info!("{:?}{:?}\x1b[33m{} \x1b[1m{}\x1b[0m", req.connection_info(), req, req.path(), body.unwrap_or("{badBodyBytes}"));
+
+    let env = req.app_data::<web::Data<Env>>().unwrap();
+
+    // Maybe log this request
+    if let Some(loggingEndpointUrl) = env.lock().unwrap().jsondb["public"]["logging"].as_str() {
+        info!("logging to {}", loggingEndpointUrl);
+        info!("{:?}", httpstxt(
+            &loggingEndpointUrl,
+            &format!("{} {} {}\n{}",
+                req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
+                req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
+                req.uri(),
+                body.unwrap_or("?")))
+        .await);
+    } else {
+        info!("not logging");
+    }
+    HttpResponse::NotFound().finish()
+}
+
 async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpResponse {
     let body = from_utf8(&body);
     info!("{:?}{:?}\x1b[33m{} \x1b[1m{}\x1b[0m", req.connection_info(), req, path, body.unwrap_or("{badBodyBytes}"));
@@ -649,7 +711,7 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
             &format!("{} {} {}\n{}",
                 req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
                 req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
-                path,
+                req.path(),
                 body.unwrap_or("?")))
         .await);
     } else {
@@ -658,14 +720,19 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
 
     // Direct pointer lookup
     if pointer != "" {
+        let contentType = env.lock().unwrap().jsondb[key]["Content-Type"].as_str().map(|s|s.to_string());
         return match env.lock().unwrap().jsondb.pointer_mut(&("/".to_string()+path)) {
-           None => {
+            None => {
                 error!("None");
                 HttpResponse::NotAcceptable().json(Value::Null)
-           },
-           Some(v) => {
-               info!("{}", v);
-               HttpResponse::Ok().json(v.clone())
+            },
+            Some(v) => {
+                info!("{}", v);
+                let mut resp = HttpResponse::Ok();
+                if let Some(ct) = contentType {
+                   resp.content_type(ct);
+                }
+                resp.json(v.clone())
            }
        }
     }
@@ -725,7 +792,7 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
     }
 }
 
-async fn keyValueStoreV2 (req: HttpRequest, body: web::Bytes) -> HttpResponse {
+async fn jsonDbV1Public (req: HttpRequest, body: web::Bytes) -> HttpResponse {
     let key = "public";
      handler(key, &req, body).await
 }
@@ -774,9 +841,10 @@ async fn launch () -> Bresult<()> {
     HttpServer::new(move ||
         App::new()
         .data(envc.clone())
-        .service(web::resource("keyvaluestore/v2").route(Route::new().to(keyValueStoreV2)))
-        .service(web::resource("jsondb/v1/*"     ).route(Route::new().to(jsonDbV1)))
-        .service(web::resource("/"               ).route(Route::new().to(keyValueStoreV2)))
+        .service(web::resource("/jsondb/v1/*"     ).route(Route::new().to(jsonDbV1)))
+        .service(web::resource("/keyvaluestore/v2").route(Route::new().to(jsonDbV1Public)))
+        .service(web::resource("/"                ).route(Route::new().to(jsonDbV1Public)))
+        .service(web::resource("*"                ).route(Route::new().to(loghackers)))
     ).bind_openssl( //.bind("0.0.0.0:4441")?
         "0.0.0.0:".to_string()
         + env::var_os( "DBPORT" )
