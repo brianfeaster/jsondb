@@ -8,17 +8,13 @@ use std::{
 use log::{
     error, warn, info, Record,
     Level::{self, Warn, Info, Debug, Trace}};
-
 use env_logger::fmt::{Formatter, Color};
 
 use ::openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use actix_web::{
-    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse, Route,
-    client::{Client, Connector}
-};
+use actix_web::{ web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse, Route };
+use awc::{Client};
 
 use serde_json::{json, Value};
-
 use regex::{Regex};
 
 
@@ -56,11 +52,9 @@ pub fn bytes2json (body: &[u8]) -> Bresult<Value> {
 
 async fn httpsjson (url: &Value, j: &Value) -> Bresult<Value> {
     let mut res =
-        Client::builder()
-        .connector(Connector::new().timeout(Duration::new(90,0)).finish())
-        .finish() // client
+        Client::default()
         .post(url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?)
-        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36")
+        .insert_header(("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36"))
         .timeout(Duration::new(90,0))
         .send_json(&j)
         .await?;
@@ -73,11 +67,9 @@ async fn httpsjson (url: &Value, j: &Value) -> Bresult<Value> {
 
 async fn httpstxt (url: &str, t: &str) -> Bresult<Value> {
     let mut res =
-        Client::builder()
-        .connector(Connector::new().timeout(Duration::new(90,0)).finish())
-        .finish() // client
+        Client::default()
         .post(url)
-        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36")
+        .insert_header(("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36"))
         .timeout(Duration::new(90,0))
         .send_body(t.to_string())
         .await?;
@@ -833,24 +825,20 @@ async fn launch () -> Bresult<()> {
         env::var_os("JSONDB")
             .as_ref()
             .and_then(|s|s.to_str())
-            .map(|o| o.to_string())
-            .unwrap_or("db.json".to_string()) )?;
+            .unwrap_or("db.json")
+            .to_string())?;
 
     info!("{:?}", env);
     let envc = env.clone();
     HttpServer::new(move ||
         App::new()
-        .data(envc.clone())
-        .service(web::resource("/jsondb/v1/*"     ).route(Route::new().to(jsonDbV1)))
-        .service(web::resource("/keyvaluestore/v2").route(Route::new().to(jsonDbV1Public)))
-        .service(web::resource("/"                ).route(Route::new().to(jsonDbV1Public)))
-        .service(web::resource("*"                ).route(Route::new().to(loghackers)))
+        .app_data(web::Data::new(envc.clone()))
+        .service(web::resource("/jsondb/v1/{tail}*").route(Route::new().to(jsonDbV1)))
+        .service(web::resource("/keyvaluestore/v2" ).route(Route::new().to(jsonDbV1Public)))
+        .service(web::resource("/"                 ).route(Route::new().to(jsonDbV1Public)))
+        .service(web::resource("{tail}*"           ).route(Route::new().to(loghackers)))
     ).bind_openssl( //.bind("0.0.0.0:4441")?
-        "0.0.0.0:".to_string()
-        + env::var_os( "DBPORT" )
-            .as_ref()
-            .and_then( |s|s.to_str() )
-            .unwrap_or( "4441" ),
+        format!("0.0.0.0:{}", env::var( "DBPORT" ).as_deref().unwrap_or("4441")),
         ssl_acceptor_builder)?
     .shutdown_timeout(60)
     .run()

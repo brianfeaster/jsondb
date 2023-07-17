@@ -11,6 +11,7 @@ lto = "off"
 env_logger = "*"
 log = "*"
 openssl = "*"
-actix-web = { version = "3.*", features = ["openssl"] }
+actix-web = { version = "*", features = ["openssl"] }
+awc = { version = "*", features = ["openssl"] }
 serde_json = "*"
 regex = "*"
