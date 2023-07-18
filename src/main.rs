@@ -11,7 +11,10 @@ use log::{
 use env_logger::fmt::{Formatter, Color};
 
 use ::openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use actix_web::{ web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse, Route };
+use actix_web::{
+    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse, Route,
+    http::header::HeaderMap};
+
 use awc::{Client};
 
 use serde_json::{json, Value};
@@ -44,40 +47,106 @@ fn logger_init () {
     .init();
 }
 
-////////////////////////////////////////////////////////////////////////////////
-
 pub fn bytes2json (body: &[u8]) -> Bresult<Value> {
     Ok( serde_json::from_str( from_utf8(&body)? )? )
 }
 
-async fn httpsjson (url: &Value, j: &Value) -> Bresult<Value> {
+fn headersCompact (hm: &HeaderMap) -> Vec<String> {
+    hm.iter()
+    .map(|(k,v)| format!("{}:{}", k, v.to_str().unwrap_or("?")))
+    .collect::<Vec<String>>()
+}
+
+
+fn dbReq (req: &HttpRequest, body: &web::Bytes) {
+    info!(" \x1b[1;35m{} \x1b[0;35m{:?} \x1b[33m{:?} \x1b[0m{}",
+        req.peer_addr().map(|sa|sa.ip().to_string()).as_deref().unwrap_or("?"),
+        req.uri(),
+        body,
+        headersCompact(req.headers()).join("  "));
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+// https://docs.rs/http/0.2.8/src/http/status.rs.html
+
+fn httpResponseOkBody (val: String) -> HttpResponse {
+    let resp = HttpResponse::Ok().body(val.clone());
+    info!("200/OK \x1b[33m{:?}\x1b[0m {}\n", val, headersCompact(resp.headers()).join("  "));
+    resp
+}
+
+fn httpResponseOkJsonContentType (val: &Value, ct: Option<String>) -> HttpResponse {
+    let mut resp = HttpResponse::Ok();
+    if let Some(ct) = ct { resp.content_type(ct); }
+    let resp = resp.json(val.clone());
+    info!("<= 200/OK \x1b[33m{}\x1b[0m {}\n", val, headersCompact(resp.headers()).join("  "));
+    resp
+}
+
+fn httpResponseNotFound () -> HttpResponse {
+    let resp = HttpResponse::NotFound().finish();
+    error!("404/NotFound {}\n", headersCompact(resp.headers()).join("  "));
+    resp
+}
+
+fn httpResponseNotAcceptableJson (val: Value) -> HttpResponse {
+    let resp = HttpResponse::NotAcceptable().json(val.clone());
+    error!("406/NotAcceptable \x1b[33m{}\x1b[0m {}\n", val, headersCompact(resp.headers()).join("  "));
+    resp
+}
+
+fn httpResponseBadRequestJson (val: Value) -> HttpResponse {
+    let resp = HttpResponse::BadRequest().json(val.clone());
+    error!("400/BadRequest \x1b[33m{}\x1b[0m {}\n", val, headersCompact(resp.headers()).join("  "));
+    resp
+}
+
+async fn httpsjson (url: &Value, val: &Value) -> Bresult<Value> {
+    info!("<= \x1b[34m{} \x1b[1m{}\x1b[0m", url, val.to_string());
     let mut res =
         Client::default()
         .post(url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?)
-        .insert_header(("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36"))
+        .insert_header(("User-Agent", "TMBot"))
         .timeout(Duration::new(90,0))
-        .send_json(&j)
+        .send_json(&val)
         .await?;
-
-    warn!("httpsjson => {:?}", res);
     let body = res.body().await;
-    warn!("      => {:?}", body);
+    info!("=> \x1b[34m{:?} \x1b[1m{:?}\x1b[0m  {}",
+        res.status(),
+        body.as_ref().unwrap_or(&web::Bytes::from("?")),
+        headersCompact(&res.headers()).join("  "));
     Ok(bytes2json(&body?)?)
 }
 
-async fn httpstxt (url: &str, t: &str) -> Bresult<Value> {
+async fn httpsbody (url: &str, body: &str) -> Bresult<String> {
+    info!("<= \x1b[34m{} \x1b[1m{:?}\x1b[0m", url, body);
     let mut res =
         Client::default()
         .post(url)
-        .insert_header(("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36"))
+        .insert_header(("User-Agent", "TMBot"))
         .timeout(Duration::new(90,0))
-        .send_body(t.to_string())
+        .send_body(body.to_string())
         .await?;
-    // Log it
     let body = res.body().await;
-    let bodytxt = bytes2json(&body?)?;
-    info!("::httpstxt {} {:?} => #\"{}\"# {}", url, t, format!("{:?}", res).split("\n").collect::<Vec<&str>>().join(""), bodytxt);
-    Ok(bodytxt)
+    // Log it
+    info!("=> \x1b[34m{:?} \x1b[1m{:?}\x1b[0m  {}",
+        res.status(),
+        body.as_ref().unwrap_or(&web::Bytes::from("?")),
+        headersCompact(&res.headers()).join("  "));
+    Ok(from_utf8(&body?)?.into())
+}
+
+// Log remotely incoming request details
+async fn lgReq (req: &HttpRequest, body: &web::Bytes, remoteLogUrl: &str) -> Bresult<String> {
+    httpsbody(
+        &remoteLogUrl,
+        &format!("{} {} {}\n{}",
+            req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
+            req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
+            req.path(),
+            from_utf8(body).unwrap_or("?"))) //body.unwrp_or("?")
+    .await
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -592,7 +661,7 @@ async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Bresult<()>
         ":con" => concat(rpn),         // 'a 'b :con       =>  "ab"
         ":len" => length(rpn),         // [10 11] :len     =>  [10 11] 2
         ":fmt" => format(rpn),         // 1 2 "{}a{}" :fmt =>  "2a1"
-        ":web" => web(rpn).await,
+        ":web" => web(rpn).await,      // a.com {} :web    =>  POST {} to a.com
         ":run" => run(rpn),            // "1 2 +" :run     =>  3
         "?"    => trinary(rpn),        // b t f ?          =>  :run's t if b is 1, otherwise :run f
         ":now" => rpn.push( Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()) ), // epoch seconds
@@ -640,7 +709,6 @@ async fn do_eval<'a> (env: &'a Env, key: &'a str, prog: &str) -> Bresult<RPN<'a>
     }
 }
 
-
 async fn handler_rpn (env: &Env, key: &str, body: &str) -> HttpResponse {
     match do_eval(env, key, body).await {
         Ok(rpn) => {
@@ -648,84 +716,50 @@ async fn handler_rpn (env: &Env, key: &str, body: &str) -> HttpResponse {
                  1 =>  rpn.stk[0].clone(),
                  _ =>  Value::from(rpn.stk)
             };
-            info!("{}", val);
-            HttpResponse::Ok().body(val.to_str())
+            httpResponseOkBody(val.to_str())
         },
         Err(err) => {
             let resv = json!({
                 "body": body,
                 "error":err.to_string()
             });
-            error!("{}", resv);
-            return
-                HttpResponse::NotAcceptable()
-                .json(resv);
+            httpResponseNotAcceptableJson(resv)
         }
     }
 }
 
 async fn loghackers (req: HttpRequest, body: web::Bytes) -> HttpResponse {
-    let body = from_utf8(&body);
-    info!("{:?}{:?}\x1b[33m{} \x1b[1m{}\x1b[0m", req.connection_info(), req, req.path(), body.unwrap_or("{badBodyBytes}"));
-
+    dbReq(&req, &body);
     let env = req.app_data::<web::Data<Env>>().unwrap();
 
     // Maybe log this request
     if let Some(loggingEndpointUrl) = env.lock().unwrap().jsondb["public"]["logging"].as_str() {
-        info!("logging to {}", loggingEndpointUrl);
-        info!("{:?}", httpstxt(
-            &loggingEndpointUrl,
-            &format!("{} {} {}\n{}",
-                req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
-                req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
-                req.uri(),
-                body.unwrap_or("?")))
-        .await);
+       lgReq(&req, &body, &loggingEndpointUrl).await.ok();
     } else {
-        info!("not logging");
+        warn!("no remote logging endpoint /public/logging\n");
     }
-    HttpResponse::NotFound().finish()
+    httpResponseNotFound()
 }
 
 async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpResponse {
-    let body = from_utf8(&body);
-    info!("{:?}{:?}\x1b[33m{} \x1b[1m{}\x1b[0m", req.connection_info(), req, path, body.unwrap_or("{badBodyBytes}"));
+    dbReq(&req, &body);
+    let env = req.app_data::<web::Data<Env>>().unwrap();
 
     let (key, pointer) = path.split_at(path.find('/').unwrap_or(path.len()));
 
-    let env = req.app_data::<web::Data<Env>>().unwrap();
-
     // Maybe log this request
-    if let Some(loggingEndpointUrl) = env.lock().unwrap().jsondb[key]["logging"].as_str() {
-        info!("logging to {}", loggingEndpointUrl);
-        info!("{:?}", httpstxt(
-            &loggingEndpointUrl,
-            &format!("{} {} {}\n{}",
-                req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
-                req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
-                req.path(),
-                body.unwrap_or("?")))
-        .await);
-    } else {
-        info!("not logging");
+    if let Some(remoteLogUrl) = env.lock().unwrap().jsondb[key]["logging"].as_str() {
+       lgReq(&req, &body, &remoteLogUrl).await.ok();
     }
 
-    // Direct pointer lookup
+    let body = from_utf8(&body);
+
+    // RESTful JSON pointer lookup
     if pointer != "" {
         let contentType = env.lock().unwrap().jsondb[key]["Content-Type"].as_str().map(|s|s.to_string());
-        return match env.lock().unwrap().jsondb.pointer_mut(&("/".to_string()+path)) {
-            None => {
-                error!("None");
-                HttpResponse::NotAcceptable().json(Value::Null)
-            },
-            Some(v) => {
-                info!("{}", v);
-                let mut resp = HttpResponse::Ok();
-                if let Some(ct) = contentType {
-                   resp.content_type(ct);
-                }
-                resp.json(v.clone())
-           }
+        return match env.lock().unwrap().jsondb.pointer(&("/".to_string()+path)) {
+            Some(v) => httpResponseOkJsonContentType(&v, contentType),
+            None => httpResponseNotAcceptableJson(Value::Null)
        }
     }
 
@@ -737,9 +771,8 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
                     "body": body.unwrap(),
                     "error":e.to_string()
                 });
-                error!("{}", resv.to_string());
-                return HttpResponse::BadRequest().json(resv);
-                },
+                return httpResponseBadRequestJson(resv);
+            },
             Ok(value) => value
         }
     } else {
@@ -753,8 +786,7 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
         js.keys().for_each( |k| db[k] = js[k].clone() );
         if db.is_null() { gdb[key] = json!({}) } // Prevent null DB
         let len :Value = js.len().into();
-        info!("{}", len);
-        HttpResponse::Ok().json(len)
+        httpResponseOkJsonContentType(&len, None)
       },
       Value::Array(js) => {
         let db = &env.lock().unwrap().jsondb[key];
@@ -769,8 +801,7 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
         if res.len() == 0 {
             resv = db.clone();
         }
-        info!("{}", resv);
-        HttpResponse::Ok().json(resv)
+        httpResponseOkJsonContentType(&resv, None)
       },
       Value::String(js) => handler_rpn(env, key, &js.as_str()).await,
       _ => {
@@ -778,8 +809,7 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
             "body": value.to_string(),
             "error":"Unaccepted JSON form."
         });
-        error!("{}", resv);
-        return HttpResponse::NotAcceptable().json(resv);
+        httpResponseNotAcceptableJson(resv)
       }
     }
 }
@@ -828,15 +858,15 @@ async fn launch () -> Bresult<()> {
             .unwrap_or("db.json")
             .to_string())?;
 
-    info!("{:?}", env);
+    env.lock().map(|e| info!("{} {}", e.dbfile, e.jsondb.to_string())).map_err(|e|e.to_string())?;
+
     let envc = env.clone();
     HttpServer::new(move ||
         App::new()
         .app_data(web::Data::new(envc.clone()))
-        .service(web::resource("/jsondb/v1/{tail}*").route(Route::new().to(jsonDbV1)))
-        .service(web::resource("/keyvaluestore/v2" ).route(Route::new().to(jsonDbV1Public)))
-        .service(web::resource("/"                 ).route(Route::new().to(jsonDbV1Public)))
-        .service(web::resource("{tail}*"           ).route(Route::new().to(loghackers)))
+        .service(web::resource("/jsondb/v1/{tail:.*}").route(Route::new().to(jsonDbV1)))
+        .service(web::resource("/"                   ).route(Route::new().to(jsonDbV1Public)))
+        .service(web::resource("{tail:.*}"           ).route(Route::new().to(loghackers)))
     ).bind_openssl( //.bind("0.0.0.0:4441")?
         format!("0.0.0.0:{}", env::var( "DBPORT" ).as_deref().unwrap_or("4441")),
         ssl_acceptor_builder)?
@@ -848,7 +878,7 @@ async fn launch () -> Bresult<()> {
     let envl = env.lock().map_err(|e|e.to_string())?;
     let db = envl.jsondb.to_string();
     std::fs::write(&envl.dbfile, &db)?;
-    info!("{}\n--launch", db);
+    info!("{} {}\n--launch", envl.dbfile, db);
     Ok(())
 }
 
