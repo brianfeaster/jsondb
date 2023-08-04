@@ -1,21 +1,27 @@
 #![allow(non_snake_case)]
 
 use std::{
-    env, io::{Write}, error::Error,
-    time::{Duration, SystemTime, UNIX_EPOCH}, sync::{Arc, Mutex},
-    str::{from_utf8}};
+    env,
+    io::{Write},
+    error::Error,
+    str::{from_utf8},
+    time::{Duration, SystemTime, UNIX_EPOCH}, sync::{Arc, Mutex}};
 
 use log::{
-    error, warn, info, Record,
+  //error,
+    warn, info, Record,
     Level::{self, Warn, Info, Debug, Trace}};
+
 use env_logger::fmt::{Formatter, Color};
 
-use ::openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use ::openssl::ssl::{
+    SslAcceptor, SslFiletype, SslMethod, SslRef, SslAlert, SniError, NameType};
+
 use actix_web::{
-    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse, Route,
+    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse,
     http::header::HeaderMap};
 
-use awc::{Client};
+use awc::{Client, ClientResponse};
 
 use serde_json::{json, Value};
 use regex::{Regex};
@@ -23,7 +29,7 @@ use regex::{Regex};
 
 ////////////////////////////////////////////////////////////////////////////////
 
-pub type Bresult<T> = Result<T, Box<dyn Error>>;
+pub type Res<T> = Result<T, Box<dyn Error>>;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -37,7 +43,7 @@ fn logger_formatter (buf: &mut Formatter, rec: &Record) -> std::io::Result<()> {
             Debug => Color::Cyan,
             Trace => Color::Magenta
         });
-    let pre = style.value(format!("{} {}:{}", rec.level(), rec.target(), rec.line().unwrap()));
+    let pre = style.value(format!("{}{}", /*rec.level(),*/ rec.target(), rec.line().unwrap()));
     writeln!(buf, "{} {:?}", pre, rec.args())
 }
 
@@ -47,106 +53,128 @@ fn logger_init () {
     .init();
 }
 
-pub fn bytes2json (body: &[u8]) -> Bresult<Value> {
+pub fn bytes2json (body: &[u8]) -> Res<Value> {
     Ok( serde_json::from_str( from_utf8(&body)? )? )
 }
 
-fn headersCompact (hm: &HeaderMap) -> Vec<String> {
+fn headersPretty (hm: &HeaderMap) -> String {
     hm.iter()
-    .map(|(k,v)| format!("{}:{}", k, v.to_str().unwrap_or("?")))
+    .map(|(k,v)| format!("{}:\x1b[1;30m{}\x1b[0m", k, v.to_str().unwrap_or("?")))
     .collect::<Vec<String>>()
+    .join(" ")
 }
 
-
-fn dbReq (req: &HttpRequest, body: &web::Bytes) {
-    info!(" \x1b[1;35m{} \x1b[0;35m{:?} \x1b[33m{:?} \x1b[0m{}",
+fn reqPretty (req: &HttpRequest, body: &web::Bytes) -> String {
+    format!("\x1b[35m{} \x1b[1;35m{:?} \x1b[0;33;100m{}\x1b[0m {}",
         req.peer_addr().map(|sa|sa.ip().to_string()).as_deref().unwrap_or("?"),
         req.uri(),
-        body,
-        headersCompact(req.headers()).join("  "));
+        from_utf8(body).map(|s|s.to_string()).unwrap_or_else(|_|format!("{:?}", body)),
+        headersPretty(req.headers()))
+}
+
+fn resPretty (res: &HttpResponse, body: &str) -> String {
+    format!("\x1b[1;35m{} \x1b[0;33;100m{}\x1b[0m {}",
+        res.status(),
+        body.replace("\n"," \x1b7\x08\x1b[1m|\x1b8"),
+        headersPretty(res.headers()))
+}
+
+fn outPretty (url: &str, body: &str) -> String {
+    format!("<= \x1b[34m{} \x1b[33;100m{}\x1b[0m", url, body.replace("\n"," \x1b7\x08\x1b[1m|\x1b8"))
+}
+
+fn inPretty<T> (resp: &ClientResponse<T>,  body: &str) -> String {
+    format!("=> \x1b[34m{:?} {} \x1b[33;100m{}\x1b[0m {}",
+        resp.version(),
+        resp.status(),
+        body.replace("\n"," \x1b7\x08\x1b[1m|\x1b8"),
+        headersPretty(resp.headers()))
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// https://docs.rs/http/0.2.8/src/http/status.rs.html
 
-fn httpResponseOkBody (val: String) -> HttpResponse {
-    let resp = HttpResponse::Ok().body(val.clone());
-    info!("200/OK \x1b[33m{:?}\x1b[0m {}\n", val, headersCompact(resp.headers()).join("  "));
-    resp
-}
 
-fn httpResponseOkJsonContentType (val: &Value, ct: Option<String>) -> HttpResponse {
-    let mut resp = HttpResponse::Ok();
-    if let Some(ct) = ct { resp.content_type(ct); }
-    let resp = resp.json(val.clone());
-    info!("<= 200/OK \x1b[33m{}\x1b[0m {}\n", val, headersCompact(resp.headers()).join("  "));
-    resp
-}
-
-fn httpResponseNotFound () -> HttpResponse {
-    let resp = HttpResponse::NotFound().finish();
-    error!("404/NotFound {}\n", headersCompact(resp.headers()).join("  "));
-    resp
-}
-
-fn httpResponseNotAcceptableJson (val: Value) -> HttpResponse {
-    let resp = HttpResponse::NotAcceptable().json(val.clone());
-    error!("406/NotAcceptable \x1b[33m{}\x1b[0m {}\n", val, headersCompact(resp.headers()).join("  "));
-    resp
-}
-
-fn httpResponseBadRequestJson (val: Value) -> HttpResponse {
-    let resp = HttpResponse::BadRequest().json(val.clone());
-    error!("400/BadRequest \x1b[33m{}\x1b[0m {}\n", val, headersCompact(resp.headers()).join("  "));
-    resp
-}
-
-async fn httpsjson (url: &Value, val: &Value) -> Bresult<Value> {
-    info!("<= \x1b[34m{} \x1b[1m{}\x1b[0m", url, val.to_string());
-    let mut res =
-        Client::default()
-        .post(url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?)
-        .insert_header(("User-Agent", "TMBot"))
-        .timeout(Duration::new(90,0))
-        .send_json(&val)
-        .await?;
-    let body = res.body().await;
-    info!("=> \x1b[34m{:?} \x1b[1m{:?}\x1b[0m  {}",
-        res.status(),
-        body.as_ref().unwrap_or(&web::Bytes::from("?")),
-        headersCompact(&res.headers()).join("  "));
-    Ok(bytes2json(&body?)?)
-}
-
-async fn httpsbody (url: &str, body: &str) -> Bresult<String> {
-    info!("<= \x1b[34m{} \x1b[1m{:?}\x1b[0m", url, body);
+async fn httpsjson (url: &Value, val: &Value) -> Res<Value> {
+    let url = url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?;
+    info!("{}", outPretty(url, &val.to_string()));
     let mut res =
         Client::default()
         .post(url)
-        .insert_header(("User-Agent", "TMBot"))
+        .insert_header(("User-Agent", "JsonDb"))
+        .timeout(Duration::new(90,0))
+        .send_json(&val) // ClientRequest
+        .await?; // ClientResponse
+    let body = from_utf8(&res.body().await?)?.to_string();
+    info!("{}", inPretty(&res, &body));
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn httpsbody (url: &str, body: &str) -> Res<String> {
+    info!("  {}", outPretty(url, body));
+    let mut res =
+        Client::default()
+        .post(url)
+        .insert_header(("User-Agent", "JsonDb"))
         .timeout(Duration::new(90,0))
         .send_body(body.to_string())
         .await?;
-    let body = res.body().await;
-    // Log it
-    info!("=> \x1b[34m{:?} \x1b[1m{:?}\x1b[0m  {}",
-        res.status(),
-        body.as_ref().unwrap_or(&web::Bytes::from("?")),
-        headersCompact(&res.headers()).join("  "));
-    Ok(from_utf8(&body?)?.into())
+    let body = from_utf8(&res.body().await?)?.to_string();
+    info!("  {}", inPretty(&res, &body));
+    Ok(body)
 }
 
 // Log remotely incoming request details
-async fn lgReq (req: &HttpRequest, body: &web::Bytes, remoteLogUrl: &str) -> Bresult<String> {
+async fn logRemote (req: &HttpRequest, body: &web::Bytes, url: &str) -> Res<String> {
     httpsbody(
-        &remoteLogUrl,
+        &url,
         &format!("{} {} {}\n{}",
             req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
             req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
             req.path(),
             from_utf8(body).unwrap_or("?"))) //body.unwrp_or("?")
     .await
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// https://docs.rs/http/0.2.8/src/http/status.rs.html
+
+
+fn httpResponseOkBody (body: String) -> HttpResponse {
+    let mut resp = HttpResponse::Ok().body(body.clone());
+    info!("{}", resPretty(&mut resp, &body));
+    resp
+}
+
+fn httpResponseOkJsonContentType (val: &Value, ct: Option<String>) -> HttpResponse {
+    let mut resp = HttpResponse::Ok();
+    let resp =
+        if let Some(ct) = ct {
+            resp.content_type(ct)
+            .body(val.to_str())
+        } else {
+            resp.json(val.clone())
+        };
+    info!("{}", resPretty(&resp, &val.to_str()));
+    resp
+}
+
+fn httpResponseNotFound () -> HttpResponse {
+    let resp = HttpResponse::NotFound().finish();
+    info!("{}", resPretty(&resp, &""));
+    resp
+}
+
+fn httpResponseNotAcceptableJson (val: Value) -> HttpResponse {
+    let resp = HttpResponse::NotAcceptable().json(val.clone());
+    info!("{}", resPretty(&resp, &val.to_str()));
+    resp
+}
+
+fn httpResponseBadRequestJson (val: Value) -> HttpResponse {
+    let resp = HttpResponse::BadRequest().json(val.clone());
+    info!("{}", resPretty(&resp, &val.to_str()));
+    resp
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -166,7 +194,7 @@ impl From<EnvStruct> for Env {
 }
 
 impl EnvStruct {
-  fn new(dbfile: String) -> Bresult<Env> {
+  fn new(dbfile: String) -> Res<Env> {
     Ok(EnvStruct{
         dbfile: dbfile.clone(),
         jsondb: serde_json::from_str(
@@ -180,10 +208,10 @@ impl EnvStruct {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-trait ToNum<T> { fn toNum (&self) -> Bresult<T>; }
+trait ToNum<T> { fn toNum (&self) -> Res<T>; }
 
 impl ToNum<usize> for Value {
-    fn toNum (&self) -> Bresult<usize> {
+    fn toNum (&self) -> Res<usize> {
         self.as_u64()
         .or_else(
             || self.as_f64()
@@ -194,7 +222,7 @@ impl ToNum<usize> for Value {
 }
 
 impl ToNum<u64> for Value {
-    fn toNum (&self) -> Bresult<u64> {
+    fn toNum (&self) -> Res<u64> {
         self.as_u64()
         .or_else(
             || self.as_f64()
@@ -204,7 +232,7 @@ impl ToNum<u64> for Value {
 }
 
 impl ToNum<f64> for Value {
-    fn toNum (&self) -> Bresult<f64> {
+    fn toNum (&self) -> Res<f64> {
         self.as_f64()
         .ok_or("{notF64able}".into())
     }
@@ -226,7 +254,7 @@ impl ToStr for Value {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-fn asNum<T> (value: &Value) -> Bresult<T>
+fn asNum<T> (value: &Value) -> Res<T>
 where T: From<u8>, Value: ToNum<T>
 {
     value.toNum()
@@ -254,12 +282,12 @@ impl Prog {
     fn new (code: &str) -> Prog {
         let mut atoms =
         Regex::new(r#"(?x)
-            ( \s | ;[^\n]*(\n|$) )*     # comment
+            ( \s | ;[^\n]*(\n|$) )*       # comment
             (                             # any 3
-                (-?\d*[.]\d+ | -?\d+[.]?) # number 4
-                | ("( \\" | [^"] )*")     # string 5
-                | ([^\s;]+) )             # symbol 7
-            ( \s | ;[^\n]*(\n|$) )*     # comment
+                (-?\d*[.]\d+ | -?\d+[.]?)\s # number 4
+                | ("( \\" | [^"] )*")       # string 5
+                | ([^\s;]+) )               # symbol 7
+            ( \s | ;[^\n]*(\n|$) )*       # comment
         "#).unwrap()
         .captures_iter(code) // CaptureMatches
         .map(|caps|
@@ -295,26 +323,27 @@ struct RPN<'c> {
 
 trait Rpn<'c> {
     fn new (env: &'c Env, key: &'c str, code: &str) -> Self;
+    fn lookup (&self, sym: &str) -> Res<Value>;
     fn stkLen (&self) -> usize;
     fn stk (&mut self) -> &mut Vec<Value>;
-    fn pop (&mut self) -> Bresult<Value>;
-    fn push (&mut self, v: Value) -> Bresult<()>;
-    fn popPush (&mut self, count: usize, v: Value) -> Bresult<()>;
-    fn peek (&self, i: usize) -> Bresult<& Value>;
-    fn peekMut (&mut self, i: usize) -> Bresult<&mut Value>;
-    fn peekAsNum<U> (&mut self, i: usize) -> Bresult<U>
+    fn pop (&mut self) -> Res<Value>;
+    fn push (&mut self, v: Value) -> Res<()>;
+    fn popPush (&mut self, count: usize, v: Value) -> Res<()>;
+    fn peek (&self, i: usize) -> Res<& Value>;
+    fn peekMut (&mut self, i: usize) -> Res<&mut Value>;
+    fn peekAsNum<U> (&self, i: usize) -> Res<U>
     where
         U: From<u8>,
         Value: ToNum<U>;
-    fn popArgCount (&mut self) -> Bresult<usize>;
-    fn apply<F,U> (&mut self, f: F) -> Bresult<()>
+    fn popArgCount (&mut self) -> Res<usize>;
+    fn apply<F,U> (&mut self, f: F) -> Res<()>
     where
         Value: From<U> + ToNum<U>,
         U: From<u8>,
         F: Fn(U,U)->U;
-    fn assign(&mut self) -> Bresult<()>;
-    fn pathAssign (&mut self) -> Bresult<()>;
-    fn pathLookup (&mut self) -> Bresult<()>;
+    fn assign(&mut self) -> Res<()>;
+    fn pathAssign (&mut self) -> Res<()>;
+    fn pathLookup (&mut self) -> Res<()>;
     fn cap(&mut self) -> Option<Atom>;
 }
 
@@ -326,17 +355,22 @@ impl<'c> Rpn<'c> for RPN<'c>
       progs.push(prog);
       Self{ env, key, prog:progs, stk:Vec::new() }
     }
+    fn lookup (&self, sym: &str) -> Res<Value> {
+        self.env.lock()
+        .map_err(|e|e.to_string().into())
+        .map(|env| env.jsondb[self.key][sym].clone())
+    }
     fn stkLen (&self) -> usize { self.stk.len() }
     fn stk (&mut self) -> &mut Vec<Value> { &mut self.stk }
-    fn pop (&mut self) -> Bresult<Value> {
+    fn pop (&mut self) -> Res<Value> {
         self.stk()
         .pop()
         .ok_or("popUnderflow".into())
     }
-    fn push (&mut self, v: Value) -> Bresult<()> {
+    fn push (&mut self, v: Value) -> Res<()> {
         Ok(self.stk().push(v))
     }
-    fn popPush (&mut self, count: usize, v: Value) -> Bresult<()> {
+    fn popPush (&mut self, count: usize, v: Value) -> Res<()> {
         let len = self.stkLen();
         if len < count { Err("popPushUnderflow".into()) }
         else {
@@ -344,17 +378,17 @@ impl<'c> Rpn<'c> for RPN<'c>
             self.push(v)
         }
     }
-    fn peek (&self, i: usize) -> Bresult<&Value> {
+    fn peek (&self, i: usize) -> Res<&Value> {
         let len = self.stkLen();
         if len <= i { Err("peekUnderflow")? }
         Ok(&self.stk[len-i-1])
     }
-    fn peekMut (&mut self, i: usize) -> Bresult<&mut Value> {
+    fn peekMut (&mut self, i: usize) -> Res<&mut Value> {
         let len = self.stkLen();
         if len <= i { Err("peekMutUnderflow")? }
         Ok(&mut self.stk()[len-i-1])
     }
-    fn peekAsNum<U> (&mut self, i: usize) -> Bresult<U>
+    fn peekAsNum<U> (&self, i: usize) -> Res<U>
     where
         U: From<u8>,
         Value: ToNum<U>
@@ -370,13 +404,13 @@ impl<'c> Rpn<'c> for RPN<'c>
                                  _ => Ok(1.into())
               }))
     }
-    fn popArgCount (&mut self) -> Bresult<usize> {
+    fn popArgCount (&mut self) -> Res<usize> {
         let n = self.peekAsNum::<usize>(0)?;
         self.peek(n)?;
         self.pop()?;
         Ok(n)
     }
-    fn apply<F,U> (&mut self, f:F) -> Bresult<()>
+    fn apply<F,U> (&mut self, f:F) -> Res<()>
     where
         Value: From<U> + ToNum<U>,
         U: From<u8>,
@@ -386,7 +420,7 @@ impl<'c> Rpn<'c> for RPN<'c>
         let b = self.peekAsNum(1)?;
         self.popPush(2, f(a,b).into())
     }
-    fn assign (&mut self) -> Bresult<()>
+    fn assign (&mut self) -> Res<()>
     {
         self.peek(1)?;
         let key = self.pop()?;
@@ -394,7 +428,7 @@ impl<'c> Rpn<'c> for RPN<'c>
         self.env.lock().unwrap().jsondb[self.key][key.as_str().ok_or("assignKeyBad")?] = val;
         Ok(())
     }
-    fn pathAssign (&mut self) -> Bresult<()>
+    fn pathAssign (&mut self) -> Res<()>
     {
         let path = self.peek(0)?.as_str().ok_or("pathNotStr")?;
         let val  = self.peek(1)?.clone();
@@ -408,7 +442,7 @@ impl<'c> Rpn<'c> for RPN<'c>
         self.pop()?;
         Ok(())
     }
-    fn pathLookup (&mut self) -> Bresult<()>
+    fn pathLookup (&mut self) -> Res<()>
     {
         let path = self.peek(0)?.as_str().ok_or("pathNotStr")?;
         let ret =
@@ -435,14 +469,14 @@ impl<'c> Rpn<'c> for RPN<'c>
 } // impl Rpn for RPN
 
 
-fn makeArray (rpn: &mut RPN) -> Bresult<()> {
+fn makeArray (rpn: &mut RPN) -> Res<()> {
     let n = rpn.popArgCount()?;
     let mut v = Vec::new();
     for _ in 0..n { v.push( rpn.pop()? ) }
     rpn.push(Value::from(v))
 }
 
-fn makeDictionary (rpn: &mut RPN) -> Bresult<()> {
+fn makeDictionary (rpn: &mut RPN) -> Res<()> {
     let n = rpn.popArgCount()?;
     let mut j = json!({});
     let db = &rpn.env.lock().unwrap().jsondb[rpn.key];
@@ -454,7 +488,7 @@ fn makeDictionary (rpn: &mut RPN) -> Bresult<()> {
     rpn.push( j )
 }
 
-fn has (rpn: &mut RPN) -> Bresult<()> {
+fn has (rpn: &mut RPN) -> Res<()> {
     let key = rpn.peek(0)?;
     let blob = rpn.peek(1)?;
 
@@ -498,7 +532,22 @@ fn has (rpn: &mut RPN) -> Bresult<()> {
     rpn.popPush(1, ret)
 }
 
-fn lookup (rpn: &mut RPN) -> Bresult<()> {
+fn subAss (rpn: &mut RPN) -> Res<()> {
+    let val = rpn.peekAsNum::<f64>(1)?;
+    let sym = rpn.peek(0)?.as_str().ok_or("assignKeyBad")?;
+
+    let db = &mut rpn.env.lock().unwrap().jsondb[rpn.key];
+
+    let o = if Some('/') == sym.chars().next() {
+        db.pointer_mut(sym).ok_or("pathBad")?
+    } else {
+        &mut db[sym]
+    };
+    *o = Value::from(ToNum::<f64>::toNum(o)? - val);
+    rpn.popPush(2, o.clone())
+}
+
+fn lookup (rpn: &mut RPN) -> Res<()> {
     let key = rpn.peek(0)?;
     let blob = rpn.peek(1)?;
 
@@ -542,41 +591,41 @@ fn lookup (rpn: &mut RPN) -> Bresult<()> {
     rpn.popPush(2, ret)
 }
 
-fn insertDictionary (rpn: &mut RPN) -> Bresult<()> {
+fn insertDictionary (rpn: &mut RPN) -> Res<()> {
     rpn.peek(2).map_err( |_|"underflow" )?;
     let key = rpn.pop()?;
     rpn.peekMut(0)?[key.as_str().ok_or("keyBad")?] = rpn.pop()?;
     Ok(())
 }
 
-fn arrayPush (rpn: &mut RPN) -> Bresult<()> {
+fn arrayPush (rpn: &mut RPN) -> Res<()> {
     rpn.peek(1).map_err( |_|"underflow" )?;
     let val = rpn.pop()?;
     rpn.peekMut(0)?.as_array_mut().ok_or("notArray")?.push(val);
     Ok(())
 }
 
-fn arrayPop (rpn: &mut RPN) -> Bresult<()> {
+fn arrayPop (rpn: &mut RPN) -> Res<()> {
     let a = rpn.peekMut(0).map_err( |_|"underflow" )?;
     let v = a.as_array_mut().ok_or("not array")?.pop().ok_or("empty array")?;
     rpn.push(v)?;
     Ok(())
 }
 
-fn concat (rpn: &mut RPN) -> Bresult<()> {
+fn concat (rpn: &mut RPN) -> Res<()> {
     rpn.peek(1).map_err( |_|"underflow" )?;
     let b = rpn.pop()?;
     let a = rpn.pop()?;
     rpn.push( (a.to_str() + &b.to_str()).into() )
 }
 
-fn length (rpn: &mut RPN) -> Bresult<()> {
+fn length (rpn: &mut RPN) -> Res<()> {
     let a = rpn.peek(0).map_err( |_|"underflow" )?;
     let l = a.as_array().ok_or("not array")?.len();
     rpn.push( Value::from(l) )
 }
 
-fn format (rpn: &mut RPN) -> Bresult<()> {
+fn format (rpn: &mut RPN) -> Res<()> {
     rpn.pop()?
     .as_str().ok_or("notFormString".into())
     .map(|s| s.split("{}"))
@@ -594,21 +643,21 @@ fn format (rpn: &mut RPN) -> Bresult<()> {
     })
 }
 
-async fn web (rpn: &mut RPN<'_>) -> Bresult<()> {
+async fn web (rpn: &mut RPN<'_>) -> Res<()> {
     let j = rpn.peek(0)?;
     let url = rpn.peek(1)?;
     let res = httpsjson(&url, &j).await;
     rpn.popPush(2, res?.into())
 }
 
-fn run (rpn: &mut RPN<'_>) -> Bresult<()>
+fn run (rpn: &mut RPN<'_>) -> Res<()>
 {
     let newProg = Prog::new( rpn.pop()?.as_str().ok_or("notString")? );
     rpn.prog.push(newProg);
     Ok(())
 }
 
-fn trinary (rpn: &mut RPN<'_>) -> Bresult<()>
+fn trinary (rpn: &mut RPN<'_>) -> Res<()>
 {
     rpn.peek(2)?;
     let f = rpn.pop()?;
@@ -621,29 +670,25 @@ fn trinary (rpn: &mut RPN<'_>) -> Bresult<()>
     Ok(())
 }
 
-fn lookupRun (rpn: &mut RPN<'_>, sym: &str) -> Bresult<()>
+fn lookupRun (rpn: &mut RPN<'_>, sym: &str) -> Res<()>
 {
-    let env = rpn.env.lock().unwrap();
-    let db = env.jsondb.get(rpn.key).unwrap();
 
     if Some(':') == sym.chars().next() {
-        let code =
-            db.get(&sym[1..]).ok_or("{lookupFail}")?
-            .as_str().ok_or("notString")?;
-        let prog = Prog::new(code);
-        Ok(rpn.prog.push(prog))
+        Ok( rpn.prog.push( Prog::new( rpn.lookup(&sym[1..])?.as_str().ok_or("notString")? ) ) )
     } else {
-        rpn.push( db[sym].clone() )
+        rpn.push( rpn.lookup(sym)? )
     }
 }
 
-async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Bresult<()>
+async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Res<()>
 {
     match sym {
         "&" => rpn.apply( |a:u64, b:u64| b & a ),
         "^" => rpn.apply( |a:u64, b:u64| b ^ a ),
         "|" => rpn.apply( |a:u64, b:u64| b | a ),
         "=="=> rpn.apply( |a:f64, b:f64| if b==a{1.0}else{0.0} ),
+        "<" => rpn.apply( |a:f64, b:f64| if b<a{1.0}else{0.0} ),
+        ">" => rpn.apply( |a:f64, b:f64| if b>a{1.0}else{0.0} ),
         "+" => rpn.apply( |a:f64, b:f64| b+a ),
         "-" => rpn.apply( |a:f64, b:f64| b-a ),
         "*" => rpn.apply( |a:f64, b:f64| b*a ),
@@ -651,11 +696,12 @@ async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Bresult<()>
         "=" => rpn.assign(),           // val key =        =>  DB[key]=val
         "/=" => rpn.pathAssign(),      // val /a/2 /=      =>  DB[a][2] = val
         "/." => rpn.pathLookup(),      // /a/2 /.          =>  DB[a][2]
+        "-=" => subAss(rpn),           // val key -=       =>  DB[key]-=val
         "."  => lookup(rpn),           // a i .            =>  a[i] on array, obj, or string
         ":has" => has(rpn),            // {a:1} 'b :has    =>  {a:1} false
         ":psh" => arrayPush(rpn),      // [] 1             =>  [1]
         ":pop" => arrayPop(rpn),       // [1 2]            =>  [1] 2
-        ":ary" => makeArray(rpn),      // 10 12 14 3 :ary     =>  [14 12 10]
+        ":ary" => makeArray(rpn),      // 10 12 14 3 :ary  =>  [14 12 10]
         ":dic" => makeDictionary(rpn), // 'x 'y 2 :dic     =>  {"x":1,"y"2} values from DB or null
         ":ins" => insertDictionary(rpn),// {} val key :ins =>  {key:val}
         ":con" => concat(rpn),         // 'a 'b :con       =>  "ab"
@@ -671,7 +717,7 @@ async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Bresult<()>
 
 ////////////////////////////////////////////////////////////////////////////////
 
-async fn do_eval<'a> (env: &'a Env, key: &'a str, prog: &str) -> Bresult<RPN<'a>> {
+async fn do_eval<'a> (env: &'a Env, key: &'a str, prog: &str) -> Res<RPN<'a>> {
     let mut rpn = RPN::new(env, key, prog);
     loop {
         let atom = rpn.cap();
@@ -729,30 +775,33 @@ async fn handler_rpn (env: &Env, key: &str, body: &str) -> HttpResponse {
 }
 
 async fn loghackers (req: HttpRequest, body: web::Bytes) -> HttpResponse {
-    dbReq(&req, &body);
+    info!("{}", reqPretty(&req, &body));
     let env = req.app_data::<web::Data<Env>>().unwrap();
 
     // Maybe log this request
-    if let Some(loggingEndpointUrl) = env.lock().unwrap().jsondb["public"]["logging"].as_str() {
-       lgReq(&req, &body, &loggingEndpointUrl).await.ok();
+    if let Some(url) = env.lock().unwrap().jsondb["public"]["logging"].as_str() {
+       logRemote(&req, &body, &url).await.ok();
     } else {
         warn!("no remote logging endpoint /public/logging\n");
     }
     httpResponseNotFound()
 }
 
-async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpResponse {
-    dbReq(&req, &body);
+async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpResponse {
+    info!("{}", reqPretty(&req, &body));
     let env = req.app_data::<web::Data<Env>>().unwrap();
 
     let (key, pointer) = path.split_at(path.find('/').unwrap_or(path.len()));
 
     // Maybe log this request
-    if let Some(remoteLogUrl) = env.lock().unwrap().jsondb[key]["logging"].as_str() {
-       lgReq(&req, &body, &remoteLogUrl).await.ok();
+    if let Some(url) = env.lock().unwrap().jsondb[key]["logging"].as_str() {
+       logRemote(&req, &body, &url).await.ok();
     }
 
-    let body = from_utf8(&body);
+    let body = match from_utf8(&body) {
+        Ok(body) => body,
+        Err(e) => return httpResponseNotAcceptableJson(json!({"body":"?","error":e.to_string()}))
+    };
 
     // RESTful JSON pointer lookup
     if pointer != "" {
@@ -765,10 +814,10 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
 
     // Consider HTTP request body as JSON, or treat as plaintext to evaluate in RPN
     let value = if req.content_type().find("json").is_some() {
-        match body.map_err(|e|e.to_string()).and_then(|b|serde_json::from_str(&b).map_err(|e|e.to_string())) {
+        match serde_json::from_str(&body).map_err(|e|e.to_string()) {
             Err(e) => {
                 let resv = json!({
-                    "body": body.unwrap(),
+                    "body": body,
                     "error":e.to_string()
                 });
                 return httpResponseBadRequestJson(resv);
@@ -776,7 +825,7 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
             Ok(value) => value
         }
     } else {
-        return handler_rpn(env, key, &body.unwrap()).await
+        return handler_rpn(env, key, &body).await
     };
 
     match &value {
@@ -816,7 +865,7 @@ async fn handler (path: &str, req: &HttpRequest, body: web::Bytes) -> HttpRespon
 
 async fn jsonDbV1Public (req: HttpRequest, body: web::Bytes) -> HttpResponse {
     let key = "public";
-     handler(key, &req, body).await
+     handler(key, req, body).await
 }
 
 async fn jsonDbV1 (req: HttpRequest, body: web::Bytes) -> HttpResponse {
@@ -829,28 +878,63 @@ async fn jsonDbV1 (req: HttpRequest, body: web::Bytes) -> HttpResponse {
             .and_then(|re| re.captures(path).ok_or("Bad Key".into()))
             .and_then(|cap| cap.get(1).ok_or(String::new()))
         {
-            Ok(key) => key.as_str(),
+            Ok(key) => key.as_str().to_string(),
             Err(s) => { return HttpResponse::BadRequest().body(s) }
         }
     };
 
-    handler(key, &req, body).await
+    handler(&key, req, body).await
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////
 
-async fn launch () -> Bresult<()> {
-    println!("::launch");
+pub fn verifyServerName (crt_pem: &str)
+    -> Res<
+        impl Fn(&mut SslRef, &mut SslAlert)
+        -> Result<(), SniError> >
+{   
+    let mut names = Vec::new();
+    let mut ab = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
+    ab.set_certificate_chain_file(crt_pem)?;
+    // Make list of domain names from certificate
+    ab.build().context().certificate().map(|cert| {
+        // SAN
+        cert.subject_alt_names()
+        .map( |sans|
+            sans.iter()
+            .for_each( |gn| {
+                gn.dnsname()
+                .map( |n|
+                    names.push(n.to_string())); } ) );
+        // CN
+        cert.subject_name().entries()
+        .for_each( |xne| {
+            from_utf8(xne.data().as_slice())
+            .map( |n| names.push(n.to_string()))
+            .ok(); } );
+    } );
+    Ok(move |sr: &mut SslRef, _: &mut SslAlert| {
+        let sni = sr.servername(NameType::HOST_NAME).unwrap_or("");
+        if !names.iter().any(|n| sni==n) {
+            warn!("Rejected SNI '{}'", sni);
+            Err(SniError::ALERT_FATAL)
+        } else {
+            Ok(())
+        }
+    })
+}
 
-    let mut ssl_acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
-    ssl_acceptor_builder.set_private_key_file(
-        env::var_os("KEYPEM").as_ref().ok_or("Bad KEYPEM path")?,
-        SslFiletype::PEM
-    )?;
-    ssl_acceptor_builder.set_certificate_chain_file(
-        env::var_os("CRTPEM").as_ref().ok_or("Bad CRTPEM path")?
-    )?;
+async fn launch () -> Res<()> {
+    info!("::launch");
+
+    let key_pem = env::var_os("KEYPEM").ok_or("Bad KEYPEM")?.into_string().unwrap();
+    let crt_pem = env::var_os("CRTPEM").ok_or("Bad CRTPEM")?.into_string().unwrap();
+    let mut acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
+    acceptor_builder.set_private_key_file(&key_pem, SslFiletype::PEM)?;
+    acceptor_builder.set_certificate_chain_file(&crt_pem)?;
+    acceptor_builder.set_servername_callback(verifyServerName(&crt_pem)?);
+
     let env = EnvStruct::new(
         env::var_os("JSONDB")
             .as_ref()
@@ -864,12 +948,13 @@ async fn launch () -> Bresult<()> {
     HttpServer::new(move ||
         App::new()
         .app_data(web::Data::new(envc.clone()))
-        .service(web::resource("/jsondb/v1/{tail:.*}").route(Route::new().to(jsonDbV1)))
-        .service(web::resource("/"                   ).route(Route::new().to(jsonDbV1Public)))
-        .service(web::resource("{tail:.*}"           ).route(Route::new().to(loghackers)))
-    ).bind_openssl( //.bind("0.0.0.0:4441")?
+        .route("/jsondb/v1/{tail:.*}", web::to(jsonDbV1))
+        .route("/",                    web::to(jsonDbV1Public))
+        .route("{tail:.*}",            web::to(loghackers)))
+    .workers(2)
+    .bind_openssl( //.bind("0.0.0.0:4441")?
         format!("0.0.0.0:{}", env::var( "DBPORT" ).as_deref().unwrap_or("4441")),
-        ssl_acceptor_builder)?
+        acceptor_builder)?
     .shutdown_timeout(60)
     .run()
     .await?;
@@ -887,6 +972,6 @@ async fn launch () -> Bresult<()> {
 #[actix_web::main]
 async fn main() {
     logger_init();
-    println!("::main");
-    println!("--main {:?}", launch().await);
+    info!("::main");
+    info!("--main {:?}", launch().await);
 }
