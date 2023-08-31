@@ -10,8 +10,8 @@ lto = "off"
 [dependencies]
 env_logger = "*"
 log = "*"
+regex = "*"
+serde_json = "*"
 openssl = "*"
 actix-web = { version = "*", features = ["openssl"] }
 awc = { version = "*", features = ["openssl"] }
-serde_json = "*"
-regex = "*"

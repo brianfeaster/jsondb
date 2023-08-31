@@ -59,35 +59,37 @@ pub fn bytes2json (body: &[u8]) -> Res<Value> {
 
 fn headersPretty (hm: &HeaderMap) -> String {
     hm.iter()
-    .map(|(k,v)| format!("{}:\x1b[1;30m{}\x1b[0m", k, v.to_str().unwrap_or("?")))
+    .map(|(k,v)| format!("\x1b[0m {}:\x1b[1;30m{}", k, v.to_str().unwrap_or("?")))
     .collect::<Vec<String>>()
-    .join(" ")
+    .join("")
 }
 
 fn reqPretty (req: &HttpRequest, body: &web::Bytes) -> String {
-    format!("\x1b[35m{} \x1b[1;35m{:?} \x1b[0;33;100m{}\x1b[0m {}",
+    format!("\x1b[1;35m{} {:?} {} \x1b[22m{:?} \x1b[33;100m{}{}",
         req.peer_addr().map(|sa|sa.ip().to_string()).as_deref().unwrap_or("?"),
+        req.version(),
+        req.method(),
         req.uri(),
         from_utf8(body).map(|s|s.to_string()).unwrap_or_else(|_|format!("{:?}", body)),
         headersPretty(req.headers()))
 }
 
 fn resPretty (res: &HttpResponse, body: &str) -> String {
-    format!("\x1b[1;35m{} \x1b[0;33;100m{}\x1b[0m {}",
+    format!("\x1b[1;35m{} \x1b[0;33;100m{}{}",
         res.status(),
-        body.replace("\n"," \x1b7\x08\x1b[1m|\x1b8"),
+        body.replace("\n"," \x1b7\x08\x1b[43m \x1b8"),
         headersPretty(res.headers()))
 }
 
 fn outPretty (url: &str, body: &str) -> String {
-    format!("<= \x1b[34m{} \x1b[33;100m{}\x1b[0m", url, body.replace("\n"," \x1b7\x08\x1b[1m|\x1b8"))
+    format!("<= \x1b[34m{} \x1b[33;100m{}", url, body.replace("\n"," \x1b7\x08\x1b[43m \x1b8"))
 }
 
 fn inPretty<T> (resp: &ClientResponse<T>,  body: &str) -> String {
-    format!("=> \x1b[34m{:?} {} \x1b[33;100m{}\x1b[0m {}",
+    format!("=> \x1b[34m{:?} {} \x1b[33;100m{}{}",
         resp.version(),
         resp.status(),
-        body.replace("\n"," \x1b7\x08\x1b[1m|\x1b8"),
+        body.replace("\n"," \x1b7\x08\x1b[43m \x1b8"),
         headersPretty(resp.headers()))
 }
 
@@ -95,19 +97,26 @@ fn inPretty<T> (resp: &ClientResponse<T>,  body: &str) -> String {
 
 
 
-async fn httpsjson (url: &Value, val: &Value) -> Res<Value> {
+async fn webhttps (url: &Value, val: &Value) -> Res<Value> {
     let url = url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?;
     info!("{}", outPretty(url, &val.to_string()));
-    let mut res =
+    let mut res = if val.is_null() {
+        Client::default()
+        .get(url)
+        .timeout(Duration::new(90,0))
+        .send()
+        .await?
+    } else {
         Client::default()
         .post(url)
         .insert_header(("User-Agent", "JsonDb"))
         .timeout(Duration::new(90,0))
         .send_json(&val) // ClientRequest
-        .await?; // ClientResponse
+        .await? // ClientResponse
+    };
     let body = from_utf8(&res.body().await?)?.to_string();
     info!("{}", inPretty(&res, &body));
-    Ok(serde_json::from_str(&body)?)
+    Ok(if body.is_empty() { Value::Null } else { serde_json::from_str(&body)? })
 }
 
 async fn httpsbody (url: &str, body: &str) -> Res<String> {
@@ -146,16 +155,24 @@ fn httpResponseOkBody (body: String) -> HttpResponse {
     resp
 }
 
-fn httpResponseOkJsonContentType (val: &Value, ct: Option<String>) -> HttpResponse {
+fn httpResponseOkJsonContentType (val: &Value, headers: Value) -> HttpResponse {
     let mut resp = HttpResponse::Ok();
-    let resp =
-        if let Some(ct) = ct {
-            resp.content_type(ct)
-            .body(val.to_str())
-        } else {
-            resp.json(val.clone())
-        };
-    info!("{}", resPretty(&resp, &val.to_str()));
+    let mut isJson = false;
+
+    headers.as_object().map(|headers| headers.iter().for_each(|(k,v)| {
+        v.as_str().map(|s| {
+           if s.find("json").is_some() { isJson = true }
+           resp.insert_header((&k[..],s));
+        });
+    }));
+
+    let resp = if headers.is_object() && isJson {
+        resp.json(val.clone())
+    } else {
+        resp.body(val.to_str_alt())
+    };
+
+    info!("{}", resPretty(&resp, &val.to_str_alt()));
     resp
 }
 
@@ -167,13 +184,13 @@ fn httpResponseNotFound () -> HttpResponse {
 
 fn httpResponseNotAcceptableJson (val: Value) -> HttpResponse {
     let resp = HttpResponse::NotAcceptable().json(val.clone());
-    info!("{}", resPretty(&resp, &val.to_str()));
+    info!("{}", resPretty(&resp, &val.to_str_alt()));
     resp
 }
 
 fn httpResponseBadRequestJson (val: Value) -> HttpResponse {
     let resp = HttpResponse::BadRequest().json(val.clone());
-    info!("{}", resPretty(&resp, &val.to_str()));
+    info!("{}", resPretty(&resp, &val.to_str_alt()));
     resp
 }
 
@@ -241,11 +258,11 @@ impl ToNum<f64> for Value {
 ////////////////////////////////////////////////////////////////////////////////
 
 trait ToStr {
-  fn to_str (&self) -> String;
+  fn to_str_alt (&self) -> String;
 }
 
 impl ToStr for Value {
-  fn to_str (&self) -> String {
+  fn to_str_alt (&self) -> String {
     self.as_str()
     .map(<str>::to_string)
     .unwrap_or_else(||self.to_string())
@@ -522,7 +539,7 @@ fn has (rpn: &mut RPN) -> Res<()> {
             blob.as_object()
             .ok_or("impossible".into())
             .and_then( |o|
-                Ok(o.get(&key.to_str())
+                Ok(o.get(&key.to_str_alt())
                 .map(|_c| Value::Bool(true) )
                 .unwrap_or_else(||Value::Bool(false))))
         } else {
@@ -581,7 +598,7 @@ fn lookup (rpn: &mut RPN) -> Res<()> {
             blob.as_object()
             .ok_or("impossible".into())
             .and_then( |o|
-                o.get(&key.to_str())
+                o.get(&key.to_str_alt())
                 .map( |v| v.clone())
                 .ok_or("badKey".into()) )
         } else {
@@ -616,7 +633,7 @@ fn concat (rpn: &mut RPN) -> Res<()> {
     rpn.peek(1).map_err( |_|"underflow" )?;
     let b = rpn.pop()?;
     let a = rpn.pop()?;
-    rpn.push( (a.to_str() + &b.to_str()).into() )
+    rpn.push( (a.to_str_alt() + &b.to_str_alt()).into() )
 }
 
 fn length (rpn: &mut RPN) -> Res<()> {
@@ -635,7 +652,7 @@ fn format (rpn: &mut RPN) -> Res<()> {
             first,
             |r, a|
                 r + &rpn.pop()
-                    .map(|v|v.to_str())
+                    .map(|v|v.to_str_alt())
                     .unwrap_or_else( |e| e.to_string())
                 + a
         );
@@ -646,7 +663,8 @@ fn format (rpn: &mut RPN) -> Res<()> {
 async fn web (rpn: &mut RPN<'_>) -> Res<()> {
     let j = rpn.peek(0)?;
     let url = rpn.peek(1)?;
-    let res = httpsjson(&url, &j).await;
+    let res = webhttps(&url, &j).await;
+    warn!("{:?}", res);
     rpn.popPush(2, res?.into())
 }
 
@@ -738,7 +756,7 @@ async fn do_eval<'a> (env: &'a Env, key: &'a str, prog: &str) -> Res<RPN<'a>> {
                 Box::<dyn Error>::from( // Format stack into simple string error
                     rpn.stk()
                     .into_iter()
-                    .fold(String::new(), |r,a| r + " " + &a.to_str()) )
+                    .fold(String::new(), |r,a| r + " " + &a.to_str_alt()) )
             })
         }?;
 
@@ -750,7 +768,7 @@ async fn do_eval<'a> (env: &'a Env, key: &'a str, prog: &str) -> Res<RPN<'a>> {
             return Err(Box::<dyn Error>::from( // Format stack into simple string error
                 rpn.stk()
                 .into_iter()
-                .fold(String::new(), |r,a| r + " " + &a.to_str()) ))
+                .fold(String::new(), |r,a| r + " " + &a.to_str_alt()) ))
         }
     }
 }
@@ -762,7 +780,11 @@ async fn handler_rpn (env: &Env, key: &str, body: &str) -> HttpResponse {
                  1 =>  rpn.stk[0].clone(),
                  _ =>  Value::from(rpn.stk)
             };
-            httpResponseOkBody(val.to_str())
+            let headers = {
+                let env = env.lock().unwrap();
+                env.jsondb[key]["Headers"].clone()
+            };
+            httpResponseOkJsonContentType(&val, headers)
         },
         Err(err) => {
             let resv = json!({
@@ -788,6 +810,7 @@ async fn loghackers (req: HttpRequest, body: web::Bytes) -> HttpResponse {
 }
 
 async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpResponse {
+    println!();
     info!("{}", reqPretty(&req, &body));
     let env = req.app_data::<web::Data<Env>>().unwrap();
 
@@ -805,9 +828,15 @@ async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpRespons
 
     // RESTful JSON pointer lookup
     if pointer != "" {
-        let contentType = env.lock().unwrap().jsondb[key]["Content-Type"].as_str().map(|s|s.to_string());
-        return match env.lock().unwrap().jsondb.pointer(&("/".to_string()+path)) {
-            Some(v) => httpResponseOkJsonContentType(&v, contentType),
+        let (headers, val) = {
+            let env = env.lock().unwrap();
+            (
+                env.jsondb[key]["Headers"].clone(),
+                env.jsondb.pointer(&("/".to_string()+path)).map(|r| r.clone())
+            )
+        };
+        return match val {
+            Some(v) => httpResponseOkJsonContentType(&v, headers),
             None => httpResponseNotAcceptableJson(Value::Null)
        }
     }
@@ -830,27 +859,32 @@ async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpRespons
 
     match &value {
       Value::Object(js) => {
-        let gdb = &mut env.lock().unwrap().jsondb;
-        let db = &mut gdb[key];
-        js.keys().for_each( |k| db[k] = js[k].clone() );
-        if db.is_null() { gdb[key] = json!({}) } // Prevent null DB
-        let len :Value = js.len().into();
-        httpResponseOkJsonContentType(&len, None)
+        let len = {
+            let gdb = &mut env.lock().unwrap().jsondb;
+            let db = &mut gdb[key];
+            js.keys().for_each( |k| db[k] = js[k].clone() );
+            if db.is_null() { gdb[key] = json!({}) } // Prevent null DB
+            js.len().into()
+        };
+        httpResponseOkJsonContentType(&len, Value::Null)
       },
       Value::Array(js) => {
-        let db = &env.lock().unwrap().jsondb[key];
-        let mut resv = json!({});
-        let res = resv.as_object_mut().unwrap();
+        let resv =  {
+            let db = &env.lock().unwrap().jsondb[key];
+            let mut resv = json!({});
+            let res = resv.as_object_mut().unwrap();
 
-        for k in js {
-            let k = k.to_str();
-            let v = db[&k].clone();
-            res.insert(k.into(), v);
-        }
-        if res.len() == 0 {
-            resv = db.clone();
-        }
-        httpResponseOkJsonContentType(&resv, None)
+            for k in js {
+                let k = k.to_str_alt();
+                let v = db[&k].clone();
+                res.insert(k.into(), v);
+            }
+            if res.len() == 0 {
+                resv = db.clone();
+            }
+            resv
+        };
+        httpResponseOkJsonContentType(&resv, Value::Null)
       },
       Value::String(js) => handler_rpn(env, key, &js.as_str()).await,
       _ => {
