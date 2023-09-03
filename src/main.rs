@@ -5,7 +5,7 @@ use std::{
     io::{Write},
     error::Error,
     str::{from_utf8},
-    time::{Duration, SystemTime, UNIX_EPOCH}, sync::{Arc, Mutex}};
+    time::{Duration, SystemTime, UNIX_EPOCH}, sync::{RwLockReadGuard, RwLockWriteGuard, RwLock}};
 
 use log::{
   //error,
@@ -18,7 +18,7 @@ use ::openssl::ssl::{
     SslAcceptor, SslFiletype, SslMethod, SslRef, SslAlert, SniError, NameType};
 
 use actix_web::{
-    web, App, HttpRequest, HttpMessage, HttpServer, HttpResponse,
+    web::{to, Bytes, Data}, App, HttpRequest, HttpMessage, HttpServer, HttpResponse,
     http::header::HeaderMap};
 
 use awc::{Client, ClientResponse};
@@ -32,6 +32,22 @@ use regex::{Regex};
 pub type Res<T> = Result<T, Box<dyn Error>>;
 
 ////////////////////////////////////////////////////////////////////////////////
+
+trait IntoString<T, E> {
+    fn okstring(self) -> Result<String, E>;
+    fn errstring(self) -> Result<T, String>;
+}
+
+impl<T, E> IntoString<T, E> for Result<T, E>
+where T: ToString, E: ToString
+{
+    fn errstring(self) -> Result<T, String> {
+        self.map_err(|e| e.to_string())
+    }
+    fn okstring(self) -> Result<String, E> {
+        self.map(|r| r.to_string())
+    }
+}
 
 fn logger_formatter (buf: &mut Formatter, rec: &Record) -> std::io::Result<()> {
     let mut style = buf.style();
@@ -64,13 +80,13 @@ fn headersPretty (hm: &HeaderMap) -> String {
     .join("")
 }
 
-fn reqPretty (req: &HttpRequest, body: &web::Bytes) -> String {
+fn reqPretty (req: &HttpRequest, body: &Bytes) -> String {
     format!("\x1b[1;35m{} {:?} {} \x1b[22m{:?} \x1b[33;100m{}{}",
         req.peer_addr().map(|sa|sa.ip().to_string()).as_deref().unwrap_or("?"),
         req.version(),
         req.method(),
         req.uri(),
-        from_utf8(body).map(|s|s.to_string()).unwrap_or_else(|_|format!("{:?}", body)),
+        from_utf8(body).okstring().unwrap_or_else(|_|format!("{:?}", body)),
         headersPretty(req.headers()))
 }
 
@@ -94,8 +110,6 @@ fn inPretty<T> (resp: &ClientResponse<T>,  body: &str) -> String {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-
-
 
 async fn webhttps (url: &Value, val: &Value) -> Res<Value> {
     let url = url.as_str().ok_or(format!("{{notStringy {:?}}}", url))?;
@@ -126,15 +140,14 @@ async fn httpsbody (url: &str, body: &str) -> Res<String> {
         .post(url)
         .insert_header(("User-Agent", "JsonDb"))
         .timeout(Duration::new(90,0))
-        .send_body(body.to_string())
-        .await?;
+        .send_body(body.to_string()).await?;
     let body = from_utf8(&res.body().await?)?.to_string();
     info!("  {}", inPretty(&res, &body));
     Ok(body)
 }
 
 // Log remotely incoming request details
-async fn logRemote (req: &HttpRequest, body: &web::Bytes, url: &str) -> Res<String> {
+async fn logRemote (req: &HttpRequest, body: &Bytes, url: &str) -> Res<String> {
     httpsbody(
         &url,
         &format!("{} {} {}\n{}",
@@ -148,7 +161,7 @@ async fn logRemote (req: &HttpRequest, body: &web::Bytes, url: &str) -> Res<Stri
 ////////////////////////////////////////////////////////////////////////////////
 // https://docs.rs/http/0.2.8/src/http/status.rs.html
 
-
+pub
 fn httpResponseOkBody (body: String) -> HttpResponse {
     let mut resp = HttpResponse::Ok().body(body.clone());
     info!("{}", resPretty(&mut resp, &body));
@@ -197,29 +210,27 @@ fn httpResponseBadRequestJson (val: Value) -> HttpResponse {
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Debug)]
-pub struct EnvStruct {
-    dbfile: String,
-    jsondb: Value     // The base JSON dictionary (holds every user database)
+struct Env {
+    db_filename: String,
+    db: RwLock<Value> // The base JSON dictionary (holds every user database)
 }
 
-type Env = Arc<Mutex<EnvStruct>>;
-
-impl From<EnvStruct> for Env {
-    fn from (envstruct: EnvStruct) -> Self {
-        Arc::new(Mutex::new(envstruct))
-    }
-}
-
-impl EnvStruct {
-  fn new(dbfile: String) -> Res<Env> {
-    Ok(EnvStruct{
-        dbfile: dbfile.clone(),
-        jsondb: serde_json::from_str(
-           std::fs::read_to_string(dbfile)
+impl Env {
+  fn new(db_filename: String) -> Res<Env> {
+    Ok(Env{
+        db_filename: db_filename.clone(),
+        db: RwLock::new(serde_json::from_str(
+           std::fs::read_to_string(db_filename)
           .as_deref()
           .map_err (|e| warn!("{:?}", e))
-          .unwrap_or(r#"{}"#))?
-    }.into())
+          .unwrap_or(r#"{}"#))?)
+    })
+  }
+  fn db_rlock(&self) -> Result<RwLockReadGuard<'_, Value>, String> {
+      Ok(self.db.read().errstring()?)
+  }
+  fn db_wlock(&self) -> Result<RwLockWriteGuard<'_, Value>, String> {
+      Ok(self.db.write().errstring()?)
   }
 }
 
@@ -330,7 +341,6 @@ impl Prog {
 }
 
 
-
 struct RPN<'c> {
    env: &'c Env,
    key: &'c str, // The database name (key in base JSON dictionary) lives as long as env.
@@ -373,9 +383,7 @@ impl<'c> Rpn<'c> for RPN<'c>
       Self{ env, key, prog:progs, stk:Vec::new() }
     }
     fn lookup (&self, sym: &str) -> Res<Value> {
-        self.env.lock()
-        .map_err(|e|e.to_string().into())
-        .map(|env| env.jsondb[self.key][sym].clone())
+        Ok(self.env.db_rlock()?[self.key][sym].clone())
     }
     fn stkLen (&self) -> usize { self.stk.len() }
     fn stk (&mut self) -> &mut Vec<Value> { &mut self.stk }
@@ -442,7 +450,7 @@ impl<'c> Rpn<'c> for RPN<'c>
         self.peek(1)?;
         let key = self.pop()?;
         let val = self.pop()?;
-        self.env.lock().unwrap().jsondb[self.key][key.as_str().ok_or("assignKeyBad")?] = val;
+        self.env.db_wlock()?[self.key][key.as_str().ok_or("assignKeyBad")?] = val;
         Ok(())
     }
     fn pathAssign (&mut self) -> Res<()>
@@ -450,7 +458,7 @@ impl<'c> Rpn<'c> for RPN<'c>
         let path = self.peek(0)?.as_str().ok_or("pathNotStr")?;
         let val  = self.peek(1)?.clone();
 
-        self.env.lock().unwrap().jsondb[self.key]
+        self.env.db_wlock()?[self.key]
         .pointer_mut(path)
         .map(|v| *v = val)
         .ok_or("badPath")?;
@@ -463,7 +471,7 @@ impl<'c> Rpn<'c> for RPN<'c>
     {
         let path = self.peek(0)?.as_str().ok_or("pathNotStr")?;
         let ret =
-            self.env.lock().unwrap().jsondb[self.key]
+            self.env.db_wlock()?[self.key]
             .pointer(path)
             .map(|v|v.clone())
             .ok_or("badPath")?;
@@ -496,7 +504,7 @@ fn makeArray (rpn: &mut RPN) -> Res<()> {
 fn makeDictionary (rpn: &mut RPN) -> Res<()> {
     let n = rpn.popArgCount()?;
     let mut j = json!({});
-    let db = &rpn.env.lock().unwrap().jsondb[rpn.key];
+    let db = &rpn.env.db_rlock()?[rpn.key];
     for _ in 0..n {
        let key = rpn.pop()?;
        let keys = key.as_str().ok_or("keyNotStr")?;
@@ -553,7 +561,7 @@ fn subAss (rpn: &mut RPN) -> Res<()> {
     let val = rpn.peekAsNum::<f64>(1)?;
     let sym = rpn.peek(0)?.as_str().ok_or("assignKeyBad")?;
 
-    let db = &mut rpn.env.lock().unwrap().jsondb[rpn.key];
+    let db = &mut rpn.env.db_wlock()?[rpn.key];
 
     let o = if Some('/') == sym.chars().next() {
         db.pointer_mut(sym).ok_or("pathBad")?
@@ -773,17 +781,14 @@ async fn do_eval<'a> (env: &'a Env, key: &'a str, prog: &str) -> Res<RPN<'a>> {
     }
 }
 
-async fn handler_rpn (env: &Env, key: &str, body: &str) -> HttpResponse {
-    match do_eval(env, key, body).await {
+async fn handler_rpn (env: &Env, key: &str, body: &str) -> Res<HttpResponse> {
+    Ok(match do_eval(env, key, body).await {
         Ok(rpn) => {
             let val = match rpn.stk.len() {
-                 1 =>  rpn.stk[0].clone(),
-                 _ =>  Value::from(rpn.stk)
+                 1 =>  rpn.stk[0].clone(), // Usual simple response is the single stack element
+                 _ =>  Value::from(rpn.stk) // Otherwise the entire (including empty) stack
             };
-            let headers = {
-                let env = env.lock().unwrap();
-                env.jsondb[key]["Headers"].clone()
-            };
+            let headers = env.db_rlock()?[key]["Headers"].clone();
             httpResponseOkJsonContentType(&val, headers)
         },
         Err(err) => {
@@ -793,52 +798,61 @@ async fn handler_rpn (env: &Env, key: &str, body: &str) -> HttpResponse {
             });
             httpResponseNotAcceptableJson(resv)
         }
-    }
+    })
 }
 
-async fn loghackers (req: HttpRequest, body: web::Bytes) -> HttpResponse {
+async fn do_loghackers (req: HttpRequest, body: Bytes) -> Res<HttpResponse> {
     info!("{}", reqPretty(&req, &body));
-    let env = req.app_data::<web::Data<Env>>().unwrap();
+    let env = req.app_data::<Data<Env>>().ok_or("web data")?;
 
     // Maybe log this request
-    if let Some(url) = env.lock().unwrap().jsondb["public"]["logging"].as_str() {
+    let logging =  env.db_rlock()?["public"]["logging"].clone();
+    if let Some(url) = logging.as_str() {
        logRemote(&req, &body, &url).await.ok();
     } else {
         warn!("no remote logging endpoint /public/logging\n");
     }
-    httpResponseNotFound()
+    Ok(httpResponseNotFound())
 }
 
-async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpResponse {
+async fn loghackers (req: HttpRequest, body: Bytes) -> HttpResponse {
+    match do_loghackers(req, body).await {
+        Err(err) => HttpResponse::BadRequest().body(err.to_string()),
+        Ok(res) => res
+    }
+}
+
+async fn handler (path: &str, req: HttpRequest, body: Bytes) -> Res<HttpResponse> {
     println!();
     info!("{}", reqPretty(&req, &body));
-    let env = req.app_data::<web::Data<Env>>().unwrap();
+    let env = req.app_data::<Data<Env>>().ok_or("webdata")?;
 
     let (key, pointer) = path.split_at(path.find('/').unwrap_or(path.len()));
 
     // Maybe log this request
-    if let Some(url) = env.lock().unwrap().jsondb[key]["logging"].as_str() {
+    let logging = env.db_rlock()?[key]["logging"].clone();
+    if let Some(url) = logging.as_str() {
        logRemote(&req, &body, &url).await.ok();
     }
 
     let body = match from_utf8(&body) {
         Ok(body) => body,
-        Err(e) => return httpResponseNotAcceptableJson(json!({"body":"?","error":e.to_string()}))
+        Err(e) => return Ok(httpResponseNotAcceptableJson(json!({"body":"?","error":e.to_string()})))
     };
 
     // RESTful JSON pointer lookup
     if pointer != "" {
         let (headers, val) = {
-            let env = env.lock().unwrap();
+            let jsondb = env.db_rlock()?;
             (
-                env.jsondb[key]["Headers"].clone(),
-                env.jsondb.pointer(&("/".to_string()+path)).map(|r| r.clone())
+                jsondb[key]["Headers"].clone(),
+                jsondb.pointer(&("/".to_string()+path)).map(|r| r.clone())
             )
         };
-        return match val {
+        return Ok(match val {
             Some(v) => httpResponseOkJsonContentType(&v, headers),
             None => httpResponseNotAcceptableJson(Value::Null)
-       }
+       })
     }
 
     // Consider HTTP request body as JSON, or treat as plaintext to evaluate in RPN
@@ -849,7 +863,7 @@ async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpRespons
                     "body": body,
                     "error":e.to_string()
                 });
-                return httpResponseBadRequestJson(resv);
+                return Ok(httpResponseBadRequestJson(resv));
             },
             Ok(value) => value
         }
@@ -860,17 +874,17 @@ async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpRespons
     match &value {
       Value::Object(js) => {
         let len = {
-            let gdb = &mut env.lock().unwrap().jsondb;
-            let db = &mut gdb[key];
+            let jdb = &mut env.db_wlock()?;
+            let db = &mut jdb[key];
             js.keys().for_each( |k| db[k] = js[k].clone() );
-            if db.is_null() { gdb[key] = json!({}) } // Prevent null DB
+            if db.is_null() { jdb[key] = json!({}) } // Prevent null DB
             js.len().into()
         };
-        httpResponseOkJsonContentType(&len, Value::Null)
+        Ok(httpResponseOkJsonContentType(&len, Value::Null))
       },
       Value::Array(js) => {
         let resv =  {
-            let db = &env.lock().unwrap().jsondb[key];
+            let db = &env.db_rlock()?[key];
             let mut resv = json!({});
             let res = resv.as_object_mut().unwrap();
 
@@ -884,7 +898,7 @@ async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpRespons
             }
             resv
         };
-        httpResponseOkJsonContentType(&resv, Value::Null)
+        Ok(httpResponseOkJsonContentType(&resv, Value::Null))
       },
       Value::String(js) => handler_rpn(env, key, &js.as_str()).await,
       _ => {
@@ -892,41 +906,39 @@ async fn handler (path: &str, req: HttpRequest, body: web::Bytes) -> HttpRespons
             "body": value.to_string(),
             "error":"Unaccepted JSON form."
         });
-        httpResponseNotAcceptableJson(resv)
+        Ok(httpResponseNotAcceptableJson(resv))
       }
     }
 }
 
-async fn jsonDbV1Public (req: HttpRequest, body: web::Bytes) -> HttpResponse {
-    let key = "public";
-     handler(key, req, body).await
+async fn jsonDbV1Public (req: HttpRequest, body: Bytes) -> HttpResponse {
+     match handler("public", req, body).await {
+        Err(err) => HttpResponse::BadRequest().body(err.to_string()),
+        Ok(res) => res
+     }
 }
 
-async fn jsonDbV1 (req: HttpRequest, body: web::Bytes) -> HttpResponse {
-
-    let key = {
-        let path = req.path();
-        match
-            Regex::new(r#"^/jsondb/v1/(.+)$"#)
-            .map_err(|e| e.to_string())
-            .and_then(|re| re.captures(path).ok_or("Bad Key".into()))
-            .and_then(|cap| cap.get(1).ok_or(String::new()))
-        {
-            Ok(key) => key.as_str().to_string(),
-            Err(s) => { return HttpResponse::BadRequest().body(s) }
-        }
-    };
-
+async fn pre_handler (req: HttpRequest, body: Bytes) -> Res<HttpResponse> {
+    let key = 
+        Regex::new(r#"^/jsondb/v1/(.+)$"#)?
+        .captures(req.path())
+        .ok_or("Bad Key".into())
+        .and_then(|cap| cap.get(1).ok_or(String::new()))
+        .map(|key| key.as_str())?
+        .to_string();
     handler(&key, req, body).await
 }
 
+async fn jsonDbV1 (req: HttpRequest, body: Bytes) -> HttpResponse {
+    match pre_handler(req, body).await {
+        Err(err) => HttpResponse::BadRequest().body(err.to_string()),
+        Ok(res) => res
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
-pub fn verifyServerName (crt_pem: &str)
-    -> Res<
-        impl Fn(&mut SslRef, &mut SslAlert)
-        -> Result<(), SniError> >
+pub fn verifyServerName (crt_pem: &str) -> Res<impl Fn(&mut SslRef, &mut SslAlert) -> Result<(), SniError>>
 {   
     let mut names = Vec::new();
     let mut ab = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
@@ -969,22 +981,22 @@ async fn launch () -> Res<()> {
     acceptor_builder.set_certificate_chain_file(&crt_pem)?;
     acceptor_builder.set_servername_callback(verifyServerName(&crt_pem)?);
 
-    let env = EnvStruct::new(
+    let env = Data::new(Env::new(
         env::var_os("JSONDB")
             .as_ref()
             .and_then(|s|s.to_str())
             .unwrap_or("db.json")
-            .to_string())?;
+            .to_string())?);
 
-    env.lock().map(|e| info!("{} {}", e.dbfile, e.jsondb.to_string())).map_err(|e|e.to_string())?;
+    info!("{} {}", env.db_filename, env.db_rlock()?);
 
-    let envc = env.clone();
+    let env2 = env.clone();
     HttpServer::new(move ||
         App::new()
-        .app_data(web::Data::new(envc.clone()))
-        .route("/jsondb/v1/{tail:.*}", web::to(jsonDbV1))
-        .route("/",                    web::to(jsonDbV1Public))
-        .route("{tail:.*}",            web::to(loghackers)))
+        .app_data(env2.clone())
+        .route("/jsondb/v1/{tail:.*}", to(jsonDbV1))
+        .route("/",                    to(jsonDbV1Public))
+        .route("{tail:.*}",            to(loghackers)))
     .workers(2)
     .bind_openssl( //.bind("0.0.0.0:4441")?
         format!("0.0.0.0:{}", env::var( "DBPORT" ).as_deref().unwrap_or("4441")),
@@ -994,10 +1006,9 @@ async fn launch () -> Res<()> {
     .await?;
 
     // Save DB
-    let envl = env.lock().map_err(|e|e.to_string())?;
-    let db = envl.jsondb.to_string();
-    std::fs::write(&envl.dbfile, &db)?;
-    info!("{} {}\n--launch", envl.dbfile, db);
+    let db = env.db_rlock()?.to_string();
+    std::fs::write(&env.db_filename, &db)?;
+    info!("{} {}\n--launch", env.db_filename, db);
     Ok(())
 }
 
