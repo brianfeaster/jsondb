@@ -36,6 +36,10 @@ macro_rules! IF {
     ($p:expr, $t:expr, $f:expr) => (if $p { $t } else { $f })
 } 
 
+fn dbport () -> String {
+    env::var("DBPORT").as_deref().unwrap_or("4442").into()
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 trait IntoString<T, E> {
@@ -96,9 +100,18 @@ fn reqPretty (req: &HttpRequest, body: &Bytes) -> String {
 }
 
 fn resPretty (res: &HttpResponse, body: &str) -> String {
+    let prettyBody = {
+        let bdy = body.replace("\n"," \x1b7\x08\x1b[43m \x1b8");
+        let len = bdy.len();
+        if 1024 < len {
+            bdy[..1024].to_string() + &" ... " + &bdy[len-1024..]
+        } else {
+            bdy
+        }
+    };
     format!("\x1b[1;35m{} \x1b[0;33;100m{}{}",
         res.status(),
-        body.replace("\n"," \x1b7\x08\x1b[43m \x1b8"),
+        prettyBody,
         headersPretty(res.headers()))
 }
 
@@ -155,9 +168,10 @@ async fn httpsbody (url: &str, body: &str) -> Res<String> {
 async fn logRemote (req: &HttpRequest, body: &Bytes, url: &str) -> Res<String> {
     httpsbody(
         &url,
-        &format!("{} {} {}\n{}",
+        &format!("{} {}:{} {}\n{}",
             req.headers().get(actix_web::http::header::USER_AGENT).and_then(|hv|hv.to_str().ok()).unwrap_or("?"),
             req.peer_addr().map(|sa|sa.ip().to_string()).unwrap_or("?".into()),
+            dbport(),
             req.path(),
             from_utf8(body).unwrap_or("?")))
     .await
@@ -178,10 +192,16 @@ async fn logErrorRemote (req: &HttpRequest, body: &Bytes, val: &Value, url: &str
 ////////////////////////////////////////////////////////////////////////////////
 // https://docs.rs/http/0.2.8/src/http/status.rs.html
 
-pub
-fn httpResponseOkBody (body: String) -> HttpResponse {
+pub fn httpResponseOkBody (body: String) -> HttpResponse {
     let mut resp = HttpResponse::Ok().body(body.clone());
     info!("{}", resPretty(&mut resp, &body));
+    resp
+}
+pub fn httpResponseOkBodyHeaders (body: String, headers: &[(&str, &str)]) -> HttpResponse {
+    let mut respbuilder = HttpResponse::Ok();
+    for header in headers { respbuilder.insert_header(*header); }
+    let resp = respbuilder.body(body.clone());
+    info!("{}", resPretty(&resp, &body));
     resp
 }
 
@@ -697,10 +717,17 @@ fn dup (rpn: &mut RPN) -> Res<()> {
     Ok(())
 }
 
-fn arrayPop (rpn: &mut RPN) -> Res<()> {
-    let a = rpn.peekMut(0).map_err( |_|"underflow" )?;
-    let v = a.as_array_mut().ok_or("not array")?.pop().ok_or("empty array")?;
-    rpn.push(v)?;
+fn popAny (rpn: &mut RPN) -> Res<()> {
+    let v = match rpn.peekMut(0).map_err( |_|"underflow" )? {
+      Value::Array(a) => a.pop().ok_or("EMPTY ARRAY")?,
+      Value::Object(h) => {
+        let k = h.keys().next().ok_or("EMPTY DICT")?.clone();
+        let (k,v) = h.remove_entry(&k).ok_or("impossible")?;
+        json!([k,v])
+      }
+      _ => Err("NOT POPABLE")?
+    };
+    rpn.push(v).ok();
     Ok(())
 }
 
@@ -713,7 +740,12 @@ fn concat (rpn: &mut RPN) -> Res<()> {
 
 fn length (rpn: &mut RPN) -> Res<()> {
     let a = rpn.peek(0).map_err( |_|"underflow" )?;
-    let l = a.as_array().ok_or("not array")?.len();
+    let l = match a {
+            Value::Array(a) => a.len(),
+            Value::String(a) => a.len(),
+            Value::Object(a) => a.len(),
+                            _ => Err("not lengthable")?
+    };
     rpn.push( Value::from(l) )
 }
 
@@ -804,7 +836,7 @@ async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Res<()>
         ":has" => has(rpn),            // {a:1} 'b :has    =>  {a:1} false
         ":dup" => dup(rpn),            // 42               =>  42 42
         ":psh" => arrayPush(rpn),      // [] 1             =>  [1]
-        ":pop" => arrayPop(rpn),       // [1 2]            =>  [1] 2
+        ":pop" => popAny(rpn),       // [1 2]            =>  [1] 2
         ":ary" => makeArray(rpn),      // 10 12 14 3 :ary  =>  [14 12 10]
         ":dic" => makeDictionary(rpn), // 'x 'y 2 :dic     =>  {"x":1,"y"2} values from DB or null
         ":ins" => insertDictionary(rpn),// {} val key :ins =>  {key:val}
@@ -846,7 +878,7 @@ async fn do_eval_rpn<'a> (env: &'a Env, key: &'a str, prog: &str) -> Res<RPN<'a>
             })
         }?;
 
-        if 100 < rpn.prog.len() {
+        if 65535 < rpn.prog.len() {
             while let Some(atom) = rpn.cap() {
                 rpn.push( match atom { Atom::Val(v) => v, Atom::Sym(v) => v } ).ok();
             }
@@ -882,6 +914,7 @@ async fn do_loghackers (req: HttpRequest, body: Bytes) -> Res<HttpResponse> {
     } else {
         warn!("no remote logging endpoint /public/logging\n");
     }
+
     Ok(httpResponseNotFound())
 }
 
@@ -993,12 +1026,20 @@ async fn jsonDbV1 (req: HttpRequest, body: Bytes) -> HttpResponse {
     }
 }
 
-//async fn jsonDbV1Public (req: HttpRequest, body: Bytes) -> HttpResponse {
-//     match handler("public", req, body).await {
-//        Err(err) => HttpResponse::BadRequest().body(err.to_string()),
-//        Ok(res) => res
-//     }
-//}
+async fn jsonDbV1Public (req: HttpRequest, body: Bytes) -> HttpResponse {
+     match handler("public", req, body).await {
+        Err(err) => HttpResponse::BadRequest().body(err.to_string()),
+        Ok(res) => res
+     }
+}
+
+pub async fn sendBigThing (req: HttpRequest, body: Bytes) -> HttpResponse {
+    info!("{}", reqPretty(&req, &body));
+    let mut bdy = String::new();
+    for _ in 0..65536*10 { bdy.push('[') }
+    for _ in 0..65536*10 { bdy.push(']') }
+    httpResponseOkBodyHeaders(bdy, &[("content-type","application/json")])
+}
 
 async fn loghackers (req: HttpRequest, body: Bytes) -> HttpResponse {
     match do_loghackers(req, body).await {
@@ -1064,12 +1105,12 @@ async fn main_web_server () -> Res<()> {
     HttpServer::new(move ||
             App::new()
                 .app_data(env2.clone())
-                .route("/jsondb/v1/{tail:.*}", to(jsonDbV1))
-              //.route("/",                    to(jsonDbV1Public))
+                //.route("/jsondb/v1/{tail:.*}", to(jsonDbV1))
+                //.route("/",                    to(jsonDbV1Public))
                 .route("{tail:.*}",            to(loghackers)))
         .workers(2)
         .bind_openssl(
-            format!("0.0.0.0:{}", env::var("DBPORT").as_deref().unwrap_or("4441")),
+            format!("0.0.0.0:{}", dbport()),
             acceptor_builder)?
         .shutdown_timeout(60)
         .run()
