@@ -302,7 +302,18 @@ impl ToNum<usize> for Value {
             || self.as_f64()
             .map(|n|n as u64) )
         .map(|n| n as usize)
-        .ok_or("{notU64able}".into())
+        .ok_or("{notUsizeable}".into())
+    }
+}
+
+impl ToNum<isize> for Value {
+    fn toNum (&self) -> Res<isize> {
+        self.as_i64()
+        .or_else(
+            || self.as_f64()
+            .map(|n|n as i64) )
+        .map(|n| n as isize)
+        .ok_or("{notIsizeable}".into())
     }
 }
 
@@ -657,8 +668,7 @@ fn lookup (rpn: &mut RPN) -> Res<()> {
     let key = rpn.peek(0)?;
     let blob = rpn.peek(1)?;
 
-    let ret =
-    if key.as_str()
+    let ret = if key.as_str()
        .map(|s| Some('/') == s.chars().next())
        .unwrap_or(false)
     {
@@ -668,9 +678,9 @@ fn lookup (rpn: &mut RPN) -> Res<()> {
             blob.as_array()
             .ok_or("impossible".into())
             .and_then( |ary|
-                asNum::<usize>(&key)
+                asNum::<isize>(&key)
                 .and_then( |k|
-                    ary.get(k)
+                    ary.get(IF!(k<0, blob.as_array().unwrap().len() as isize+k, k) as usize)
                     .map( |v| v.clone() )
                     .ok_or("arrayBadIndex".into()) ) )
         } else if blob.is_string() {
@@ -1105,7 +1115,7 @@ async fn main_web_server () -> Res<()> {
     HttpServer::new(move ||
             App::new()
                 .app_data(env2.clone())
-                //.route("/jsondb/v1/{tail:.*}", to(jsonDbV1))
+                .route("/jsondb/v1/{tail:.*}", to(jsonDbV1))
                 //.route("/",                    to(jsonDbV1Public))
                 .route("{tail:.*}",            to(loghackers)))
         .workers(2)
