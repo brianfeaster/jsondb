@@ -12,7 +12,7 @@ use log::{
     error, warn, info, Record,
     Level::{self, Warn, Info, Debug, Trace}};
 
-use env_logger::fmt::{Formatter, Color};
+use env_logger::fmt::{Formatter, style::{Color, AnsiColor::*}};
 
 use ::openssl::ssl::{
     SslAcceptor, SslFiletype, SslMethod, SslRef, SslAlert, SniError, NameType};
@@ -59,17 +59,17 @@ where T: ToString, E: ToString
 }
 
 fn logger_formatter (buf: &mut Formatter, rec: &Record) -> std::io::Result<()> {
-    let mut style = buf.style();
-    style.set_color(
-        match rec.level() {
-            Level::Error => Color::Red,
-            Warn  => Color::Yellow,
-            Info  => Color::Green,
-            Debug => Color::Cyan,
-            Trace => Color::Magenta
+    let level = rec.level();
+    let style = buf
+        .default_level_style(level)
+        .fg_color( match level {
+            Level::Error => Some(Color::Ansi(Red)),
+            Warn  => Some(Color::Ansi(Yellow)),
+            Info  => Some(Color::Ansi(Green)),
+            Debug => Some(Color::Ansi(Cyan)),
+            Trace => Some(Color::Ansi(Magenta))
         });
-    let pre = style.value(format!("{}{}", /*rec.level(),*/ rec.target(), rec.line().unwrap()));
-    writeln!(buf, "{} {:?}", pre, rec.args())
+    writeln!(buf, "{style}{}{} {:?}", /*rec.level()*/ rec.target(), rec.line().unwrap_or(0), rec.args())
 }
 
 fn logger_init () {
@@ -102,9 +102,9 @@ fn reqPretty (req: &HttpRequest, body: &Bytes) -> String {
 fn resPretty (res: &HttpResponse, body: &str) -> String {
     let prettyBody = {
         let bdy = body.replace("\n"," \x1b7\x08\x1b[43m \x1b8");
-        let len = bdy.len();
+        let len = bdy.chars().count();
         if 1024 < len {
-            bdy[..1024].to_string() + &" ... " + &bdy[len-1024..]
+            bdy.chars().take(512).collect::<String>() + &" ... " + &bdy.chars().skip(len-512).collect::<String>()
         } else {
             bdy
         }
@@ -785,6 +785,14 @@ async fn web (rpn: &mut RPN<'_>) -> Res<()> {
     rpn.popPush(2, res?.into())
 }
 
+async fn get (rpn: &mut RPN<'_>) -> Res<()> {
+    let j = rpn.peek(0)?.as_str().ok_or("notStr")?;
+    let url = rpn.peek(1)?.as_str().ok_or("notAStr")?;
+    let res = httpsbody(url, j).await;
+    warn!("{:?}", res);
+    rpn.popPush(2, res?.into())
+}
+
 fn run (rpn: &mut RPN<'_>) -> Res<()>
 {
     let newProg = Prog::new( rpn.pop()?.as_str().ok_or("notString")? );
@@ -854,6 +862,7 @@ async fn opOrLookup (rpn: &mut RPN<'_>, sym :&str) -> Res<()>
         ":len" => length(rpn),         // [10 11] :len     =>  [10 11] 2
         ":fmt" => format(rpn),         // 1 2 "{}a{}" :fmt =>  "2a1"
         ":web" => web(rpn).await,      // a.com {} :web    =>  POST {} to a.com
+        ":get" => get(rpn).await,      // a.com "..." :get =>  GET "..." to a.com
         ":run" => run(rpn),            // "1 2 +" :run     =>  3
         "?"    => trinary(rpn),        // b t f ?          =>  :run's t if b is 1, otherwise :run f
         ":now" => rpn.push( Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()) ), // epoch seconds
